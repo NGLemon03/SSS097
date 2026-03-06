@@ -1,0 +1,526 @@
+{
+  "archived_at": "2026-02-23T04:37:47+08:00",
+  "policy": "Mainline/Legacy split; legacy content is read-only and excluded from default lint/test.",
+  "strategy": "analysis/Optuna archived; mainline Optuna entry remains analysis/optuna_16.py",
+  "items": [
+    {
+      "source": "analysis/old",
+      "destination": "legacy/analysis/old",
+      "moved_at": "2026-02-23T04:37:47+08:00",
+      "file_count": 20,
+      "files": [
+        {
+          "source_path": "analysis/old/analysis_params_v0.py",
+          "destination_path": "legacy/analysis/old/analysis_params_v0.py",
+          "size": 16129
+        },
+        {
+          "source_path": "analysis/old/exit_shift_test_fixed.py",
+          "destination_path": "legacy/analysis/old/exit_shift_test_fixed.py",
+          "size": 9909
+        },
+        {
+          "source_path": "analysis/old/exit_shift_test_v2.py",
+          "destination_path": "legacy/analysis/old/exit_shift_test_v2.py",
+          "size": 4525
+        },
+        {
+          "source_path": "analysis/old/grid_search_v13_fixed.py",
+          "destination_path": "legacy/analysis/old/grid_search_v13_fixed.py",
+          "size": 6048
+        },
+        {
+          "source_path": "analysis/old/Optuna_12.py",
+          "destination_path": "legacy/analysis/old/Optuna_12.py",
+          "size": 85960
+        },
+        {
+          "source_path": "analysis/old/OSv1.py",
+          "destination_path": "legacy/analysis/old/OSv1.py",
+          "size": 12290
+        },
+        {
+          "source_path": "analysis/old/OSv2.py",
+          "destination_path": "legacy/analysis/old/OSv2.py",
+          "size": 13316
+        },
+        {
+          "source_path": "analysis/old/ROEA.py",
+          "destination_path": "legacy/analysis/old/ROEA.py",
+          "size": 5966
+        },
+        {
+          "source_path": "analysis/old/ROEAv2.py",
+          "destination_path": "legacy/analysis/old/ROEAv2.py",
+          "size": 7090
+        },
+        {
+          "source_path": "analysis/old/ROEAv3.py",
+          "destination_path": "legacy/analysis/old/ROEAv3.py",
+          "size": 7712
+        },
+        {
+          "source_path": "analysis/old/run_full_pipeline_1.py",
+          "destination_path": "legacy/analysis/old/run_full_pipeline_1.py",
+          "size": 2224
+        },
+        {
+          "source_path": "analysis/old/run_full_pipeline_2.py",
+          "destination_path": "legacy/analysis/old/run_full_pipeline_2.py",
+          "size": 2528
+        },
+        {
+          "source_path": "analysis/old/run_full_pipeline_3.py",
+          "destination_path": "legacy/analysis/old/run_full_pipeline_3.py",
+          "size": 5383
+        },
+        {
+          "source_path": "analysis/old/run_full_pipeline_4.py",
+          "destination_path": "legacy/analysis/old/run_full_pipeline_4.py",
+          "size": 5970
+        },
+        {
+          "source_path": "analysis/old/test_smart_leverage_v2.py",
+          "destination_path": "legacy/analysis/old/test_smart_leverage_v2.py",
+          "size": 6871
+        },
+        {
+          "source_path": "analysis/old/test_smart_leverage_v3.py",
+          "destination_path": "legacy/analysis/old/test_smart_leverage_v3.py",
+          "size": 6470
+        },
+        {
+          "source_path": "analysis/old/test_smart_leverage_v4.py",
+          "destination_path": "legacy/analysis/old/test_smart_leverage_v4.py",
+          "size": 7030
+        },
+        {
+          "source_path": "analysis/old/test_smart_leverage_v5.py",
+          "destination_path": "legacy/analysis/old/test_smart_leverage_v5.py",
+          "size": 6948
+        },
+        {
+          "source_path": "analysis/old/test_smart_leverage_v6.py",
+          "destination_path": "legacy/analysis/old/test_smart_leverage_v6.py",
+          "size": 6311
+        },
+        {
+          "source_path": "analysis/old/walk_forward_v13_fixed.py",
+          "destination_path": "legacy/analysis/old/walk_forward_v13_fixed.py",
+          "size": 6810
+        }
+      ]
+    },
+    {
+      "source": "analysis/past",
+      "destination": "legacy/analysis/past",
+      "moved_at": "2026-02-23T04:37:47+08:00",
+      "file_count": 29,
+      "files": [
+        {
+          "source_path": "analysis/past/adaptive_clustering_analysis_v7.py",
+          "destination_path": "legacy/analysis/past/adaptive_clustering_analysis_v7.py",
+          "size": 18627
+        },
+        {
+          "source_path": "analysis/past/adaptive_fine_clustering_v16.py",
+          "destination_path": "legacy/analysis/past/adaptive_fine_clustering_v16.py",
+          "size": 21603
+        },
+        {
+          "source_path": "analysis/past/analyze_clustering_results.py",
+          "destination_path": "legacy/analysis/past/analyze_clustering_results.py",
+          "size": 5571
+        },
+        {
+          "source_path": "analysis/past/bailey_pbo_implementation.py",
+          "destination_path": "legacy/analysis/past/bailey_pbo_implementation.py",
+          "size": 11778
+        },
+        {
+          "source_path": "analysis/past/balanced_clustering_analysis_v10.py",
+          "destination_path": "legacy/analysis/past/balanced_clustering_analysis_v10.py",
+          "size": 23115
+        },
+        {
+          "source_path": "analysis/past/balanced_pbo_approach.py",
+          "destination_path": "legacy/analysis/past/balanced_pbo_approach.py",
+          "size": 11642
+        },
+        {
+          "source_path": "analysis/past/check_results_v15.py",
+          "destination_path": "legacy/analysis/past/check_results_v15.py",
+          "size": 3389
+        },
+        {
+          "source_path": "analysis/past/cluster_trials_app.py",
+          "destination_path": "legacy/analysis/past/cluster_trials_app.py",
+          "size": 3812
+        },
+        {
+          "source_path": "analysis/past/clustering_comparison_analysis_v9.py",
+          "destination_path": "legacy/analysis/past/clustering_comparison_analysis_v9.py",
+          "size": 19576
+        },
+        {
+          "source_path": "analysis/past/clustering_interpretation_report_v4.py",
+          "destination_path": "legacy/analysis/past/clustering_interpretation_report_v4.py",
+          "size": 9335
+        },
+        {
+          "source_path": "analysis/past/compare_clustering_methods.py",
+          "destination_path": "legacy/analysis/past/compare_clustering_methods.py",
+          "size": 9736
+        },
+        {
+          "source_path": "analysis/past/comprehensive_distance_test.py",
+          "destination_path": "legacy/analysis/past/comprehensive_distance_test.py",
+          "size": 13903
+        },
+        {
+          "source_path": "analysis/past/fast_adaptive_clustering_v8.py",
+          "destination_path": "legacy/analysis/past/fast_adaptive_clustering_v8.py",
+          "size": 13072
+        },
+        {
+          "source_path": "analysis/past/fine_grained_clustering_v13.py",
+          "destination_path": "legacy/analysis/past/fine_grained_clustering_v13.py",
+          "size": 29455
+        },
+        {
+          "source_path": "analysis/past/hierarchical_cluster_stability_analysis.py",
+          "destination_path": "legacy/analysis/past/hierarchical_cluster_stability_analysis.py",
+          "size": 15964
+        },
+        {
+          "source_path": "analysis/past/hierarchical_score_analysis_v1.py",
+          "destination_path": "legacy/analysis/past/hierarchical_score_analysis_v1.py",
+          "size": 9777
+        },
+        {
+          "source_path": "analysis/past/improved_layered_clustering_v6.py",
+          "destination_path": "legacy/analysis/past/improved_layered_clustering_v6.py",
+          "size": 16190
+        },
+        {
+          "source_path": "analysis/past/improved_supervised_clustering_v5.py",
+          "destination_path": "legacy/analysis/past/improved_supervised_clustering_v5.py",
+          "size": 16800
+        },
+        {
+          "source_path": "analysis/past/multi_stage_clustering_v14.py",
+          "destination_path": "legacy/analysis/past/multi_stage_clustering_v14.py",
+          "size": 21725
+        },
+        {
+          "source_path": "analysis/past/op_hsa_analysis.py",
+          "destination_path": "legacy/analysis/past/op_hsa_analysis.py",
+          "size": 2942
+        },
+        {
+          "source_path": "analysis/past/op_hsa_analysis_v2.py",
+          "destination_path": "legacy/analysis/past/op_hsa_analysis_v2.py",
+          "size": 17538
+        },
+        {
+          "source_path": "analysis/past/param_cluster_distribution_analysis.py",
+          "destination_path": "legacy/analysis/past/param_cluster_distribution_analysis.py",
+          "size": 6274
+        },
+        {
+          "source_path": "analysis/past/practical_cluster_analysis_v12.py",
+          "destination_path": "legacy/analysis/past/practical_cluster_analysis_v12.py",
+          "size": 28992
+        },
+        {
+          "source_path": "analysis/past/quick_distance_test.py",
+          "destination_path": "legacy/analysis/past/quick_distance_test.py",
+          "size": 8930
+        },
+        {
+          "source_path": "analysis/past/risk_enhanced_clustering_analysis_v2.py",
+          "destination_path": "legacy/analysis/past/risk_enhanced_clustering_analysis_v2.py",
+          "size": 21387
+        },
+        {
+          "source_path": "analysis/past/simple_fine_clustering_v17.py",
+          "destination_path": "legacy/analysis/past/simple_fine_clustering_v17.py",
+          "size": 16147
+        },
+        {
+          "source_path": "analysis/past/single_analysis.py",
+          "destination_path": "legacy/analysis/past/single_analysis.py",
+          "size": 7299
+        },
+        {
+          "source_path": "analysis/past/small_cluster_analysis_v11.py",
+          "destination_path": "legacy/analysis/past/small_cluster_analysis_v11.py",
+          "size": 23966
+        },
+        {
+          "source_path": "analysis/past/supervised_clustering_analysis_v3.py",
+          "destination_path": "legacy/analysis/past/supervised_clustering_analysis_v3.py",
+          "size": 17100
+        }
+      ]
+    },
+    {
+      "source": "analysis/Optuna",
+      "destination": "legacy/analysis/Optuna",
+      "moved_at": "2026-02-23T04:37:47+08:00",
+      "file_count": 50,
+      "files": [
+        {
+          "source_path": "analysis/Optuna/__pycache__/EAAv001.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/EAAv001.cpython-312.pyc",
+          "size": 22692
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/EAAv002.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/EAAv002.cpython-312.pyc",
+          "size": 53162
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_10.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_10.cpython-312.pyc",
+          "size": 90090
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_10v0.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_10v0.cpython-312.pyc",
+          "size": 87002
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_11.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_11.cpython-312.pyc",
+          "size": 92784
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_11b.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_11b.cpython-312.pyc",
+          "size": 98615
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_13.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_13.cpython-312.pyc",
+          "size": 120627
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_15.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_15.cpython-312.pyc",
+          "size": 38496
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_1a.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_1a.cpython-312.pyc",
+          "size": 18262
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_1b.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_1b.cpython-312.pyc",
+          "size": 9573
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_2a.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_2a.cpython-312.pyc",
+          "size": 20242
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_3a1718.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_3a1718.cpython-312.pyc",
+          "size": 25878
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_3a1741.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_3a1741.cpython-312.pyc",
+          "size": 25882
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_4a.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_4a.cpython-312.pyc",
+          "size": 31351
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_5a.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_5a.cpython-312.pyc",
+          "size": 35380
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_6.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_6.cpython-312.pyc",
+          "size": 57774
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_7.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_7.cpython-312.pyc",
+          "size": 57872
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_71.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_71.cpython-312.pyc",
+          "size": 58050
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_8.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_8.cpython-312.pyc",
+          "size": 59195
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_8b.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_8b.cpython-312.pyc",
+          "size": 58131
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_9.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_9.cpython-312.pyc",
+          "size": 70646
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/optuna_F.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/optuna_F.cpython-312.pyc",
+          "size": 10201
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_OOS_light.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_OOS_light.cpython-312.pyc",
+          "size": 10111
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_s1.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_s1.cpython-312.pyc",
+          "size": 20322
+        },
+        {
+          "source_path": "analysis/Optuna/__pycache__/Optuna_v14.cpython-312.pyc",
+          "destination_path": "legacy/analysis/Optuna/__pycache__/Optuna_v14.cpython-312.pyc",
+          "size": 17282
+        },
+        {
+          "source_path": "analysis/Optuna/EAAv001.py",
+          "destination_path": "legacy/analysis/Optuna/EAAv001.py",
+          "size": 16908
+        },
+        {
+          "source_path": "analysis/Optuna/EAAv002.py",
+          "destination_path": "legacy/analysis/Optuna/EAAv002.py",
+          "size": 46768
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_10.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_10.py",
+          "size": 67567
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_10v0.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_10v0.py",
+          "size": 65481
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_11.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_11.py",
+          "size": 72227
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_11b.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_11b.py",
+          "size": 77335
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_13.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_13.py",
+          "size": 104300
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_15.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_15.py",
+          "size": 31369
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_1a.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_1a.py",
+          "size": 14382
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_1b.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_1b.py",
+          "size": 8114
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_2a.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_2a.py",
+          "size": 16167
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_3a1718.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_3a1718.py",
+          "size": 21134
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_3a1741.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_3a1741.py",
+          "size": 21134
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_4a.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_4a.py",
+          "size": 27106
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_5a.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_5a.py",
+          "size": 29418
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_6.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_6.py",
+          "size": 49681
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_7.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_7.py",
+          "size": 50475
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_71.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_71.py",
+          "size": 50930
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_8.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_8.py",
+          "size": 50632
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_8b.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_8b.py",
+          "size": 49360
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_9.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_9.py",
+          "size": 50264
+        },
+        {
+          "source_path": "analysis/Optuna/optuna_F.py",
+          "destination_path": "legacy/analysis/Optuna/optuna_F.py",
+          "size": 9715
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_OOS_light.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_OOS_light.py",
+          "size": 7614
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_s1.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_s1.py",
+          "size": 14719
+        },
+        {
+          "source_path": "analysis/Optuna/Optuna_v14.py",
+          "destination_path": "legacy/analysis/Optuna/Optuna_v14.py",
+          "size": 15372
+        }
+      ]
+    }
+  ]
+}

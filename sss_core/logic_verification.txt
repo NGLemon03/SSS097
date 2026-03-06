@@ -1,0 +1,59 @@
+文件验证报告: c:\Stock_reserach\002g\sss_core\logic.py
+=======================================================
+
+创建时间: 2025-12-20
+文件大小: 1029 行代码
+
+1. Streamlit 依赖检查
+   - import streamlit 语句: 0 个 ✓
+   - st. 调用: 0 个 ✓
+   - st.error/warning/info/success/sidebar/status: 0 个 ✓
+
+2. 日志器检查
+   - logger. 调用: 45 个 ✓
+   - 使用 analysis.logging_config.get_logger ✓
+
+3. 包含的函数 (18个)
+   ✓ validate_params
+   ✓ fetch_yf_data
+   ✓ is_price_data_up_to_date
+   ✓ clear_all_caches
+   ✓ force_update_price_data
+   ✓ load_data (带 @cfg.MEMORY.cache 装饰器)
+   ✓ load_data_wrapper
+   ✓ linreg_last_original
+   ✓ linreg_last_vectorized
+   ✓ calc_smaa (带 @cfg.MEMORY.cache 装饰器)
+   ✓ compute_single (带 @cfg.MEMORY.cache 装饰器)
+   ✓ compute_dual (带 @cfg.MEMORY.cache 装饰器)
+   ✓ compute_RMA (带 @cfg.MEMORY.cache 装饰器)
+   ✓ compute_ssma_turn_combined (带 @cfg.MEMORY.cache 装饰器)
+   ✓ calculate_trade_mmds
+   ✓ calculate_metrics
+   ✓ calculate_holding_periods
+   ✓ backtest_unified (不含 ensemble 分支)
+
+4. 包含的 dataclass
+   ✓ TradeSignal (ts, side, reason)
+
+5. 导入检查
+   ✓ pandas, numpy, os, warnings
+   ✓ pathlib.Path, typing, dataclasses
+   ✓ scipy.signal.find_peaks
+   ✓ yfinance
+   ✓ analysis.config 和 analysis.logging_config
+
+6. 常量定义
+   ✓ DATA_DIR = cfg.DATA_DIR
+   ✓ CACHE_DIR = cfg.CACHE_DIR
+   ✓ BASE_FEE_RATE = 0.001425
+   ✓ TAX_RATE = 0.003
+
+7. Python 语法检查
+   ✓ 通过编译检查 (py_compile)
+
+结论: ✓✓✓ 文件创建成功，满足所有要求
+- 完全独立于 Streamlit
+- 保留所有日志记录功能
+- 所有核心计算函数完整
+- 可用于命令行工具和自动化脚本

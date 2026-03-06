@@ -1,0 +1,49 @@
+{
+  "Single ★": {
+    "linlen": 60, "factor": 40, "smaalen": 20, "devwin": 40,
+    "buy_mult": 0.44, "sell_mult": 1.55, "strategy_type": "single"
+  },
+  "Single ●": {
+    "linlen": 120, "factor": 40, "smaalen": 20, "devwin": 80,
+    "buy_mult": 0.50, "sell_mult": 1.50, "strategy_type": "single"
+  },
+  "Single ▲": {
+    "linlen": 80, "factor": 10, "smaalen": 60, "devwin": 20,
+    "buy_mult": 0.40, "sell_mult": 1.50, "strategy_type": "single"
+  },
+  "Dual-Scale": {
+    "linlen": 60, "factor": 40, "smaalen": 20, "short_win": 40, "long_win": 100,
+    "buy_mult": 0.30, "sell_mult": 1.30, "strategy_type": "dual"
+  },
+  "RMA-Method": {
+    "linlen": 60, "factor": 40, "smaalen": 20, "rma_len": 60, "dev_len": 20,
+    "buy_mult": 1.00, "sell_mult": 2.00, "strategy_type": "RMA"
+  },
+  "PeakTrough": {
+    "linlen": 60, "factor": 40, "smaalen": 20, "devwin": 40,
+    "buy_mult": 0.1, "sell_mult": 0.2, "prom_factor": 0.05, "min_dist": 5,
+    "cooldown": 1, "strategy_type": "peaktrough"
+  },
+  "SSMA_turn_1": {
+    "linlen": 20, "factor": 60, "smaalen": 120, "prom_factor": 45, "min_dist": 9,
+    "buy_shift": 5, "exit_shift": 7, "vol_window": 20, "stop_loss": 0.10,
+    "quantile_win": 100, "cooldown_days": 3, "strategy_type": "ssma_turn",
+    "buy_mult": 0.5, "sell_mult": 0.5
+  },
+  "SSMA_turn_2": {
+    "linlen": 20, "factor": 60, "smaalen": 120, "prom_factor": 45, "min_dist": 9,
+    "buy_shift": 3, "exit_shift": 7, "vol_window": 20, "stop_loss": 0.10,
+    "quantile_win": 100, "cooldown_days": 3, "strategy_type": "ssma_turn",
+    "buy_mult": 0.5, "sell_mult": 0.5
+  },
+  "Ensemble_Majority_Optimized": {
+    "strategy_type": "ensemble", "method": "majority", "majority_k": 6, "floor": 0.2, 
+    "ema_span": 3, "delta_cap": 0.10, "min_cooldown_days": 5, "min_trade_dw": 0.02,
+    "buy_fee_bp": 15.0, "sell_fee_bp": 15.0, "sell_tax_bp": 30.0, "ticker": "00631L.TW"
+  },
+  "Ensemble_Proportional_Optimized": {
+    "strategy_type": "ensemble", "method": "proportional", "floor": 0.2, 
+    "ema_span": 3, "delta_cap": 0.30, "min_cooldown_days": 1, "min_trade_dw": 0.02,
+    "buy_fee_bp": 15.0, "sell_fee_bp": 15.0, "sell_tax_bp": 30.0, "ticker": "00631L.TW"
+  }
+}

@@ -1,0 +1,170 @@
+import os
+import datetime
+
+# ================= 配置區域 =================
+
+# 輸出檔案名稱
+OUTPUT_FILE = "SSS096_AI_Context.md"
+
+# 要掃描的副檔名 (只抓取程式碼與核心文檔)
+INCLUDED_EXTENSIONS = {'.py', '.yaml', '.json', '.md', '.sh'}
+
+# 強制包含的關鍵檔案 (即使在排除目錄中也想看，或是在根目錄的檔案)
+PRIORITY_FILES = [
+    "SSSv096.py",
+    "SSS_EnsembleTab.py",
+    "ensemble_wrapper.py",
+    "run_enhanced_ensemble.py",
+    "config.yaml",
+    "README.md",
+    "requirements.txt",
+    "setup.sh"
+]
+
+# 要遞迴掃描的重點目錄
+TARGET_DIRS = [
+    "sss_core",
+    "analysis",
+    "runners",
+    "tools" # 如果有工具腳本也包含
+]
+
+# 要完全忽略的目錄 (避免垃圾資訊)
+EXCLUDED_DIRS = {
+    '__pycache__', '.git', '.history', '.vscode', '.idea', 'env', 'venv', 
+    'results', 'sss_backtest_outputs', 'data', 'assets', 'test'
+}
+
+# 要忽略的特定檔案 (如過大的暫存檔)
+EXCLUDED_FILES = {
+    'poetry.lock', 'package-lock.json', '.DS_Store'
+}
+
+# ================= 程式邏輯 =================
+
+def get_file_content(filepath):
+    """讀取檔案內容，處理編碼錯誤"""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(filepath, 'r', encoding='big5') as f:
+                return f.read()
+        except Exception:
+            return f"[Error: Unable to read file encoding] {filepath}"
+    except Exception as e:
+        return f"[Error reading file: {e}]"
+
+def generate_tree(startpath, excluded_dirs):
+    """生成目錄結構樹"""
+    tree_str = "## Project Structure\n\n```text\n"
+    tree_str += f"{os.path.basename(os.path.abspath(startpath))}/\n"
+    
+    for root, dirs, files in os.walk(startpath):
+        # 過濾目錄
+        dirs[:] = [d for d in dirs if d not in excluded_dirs]
+        
+        level = root.replace(startpath, '').count(os.sep)
+        indent = '│   ' * (level)
+        subindent = '│   ' * (level + 1)
+        
+        if level > 0: # 根目錄不重複顯示
+            tree_str += f"{indent}├── {os.path.basename(root)}/\n"
+            
+        for f in files:
+            if f in EXCLUDED_FILES: continue
+            # 簡單過濾，只顯示相關副檔名在樹狀圖中，讓結構更清晰
+            ext = os.path.splitext(f)[1]
+            if ext in INCLUDED_EXTENSIONS or f in PRIORITY_FILES:
+                tree_str += f"{subindent}├── {f}\n"
+                
+    tree_str += "```\n\n"
+    return tree_str
+
+def main():
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    output_content = []
+    
+    # 1. 寫入檔頭
+    header = f"# SSS096 Project Context\nGenerated at: {timestamp}\n\n"
+    output_content.append(header)
+    
+    # 2. 生成目錄樹
+    print("Generating project tree...")
+    output_content.append(generate_tree(".", EXCLUDED_DIRS))
+    
+    output_content.append("## File Contents\n\n")
+
+    processed_files = set()
+
+    # 3. 處理優先檔案 (根目錄核心檔案)
+    print("Processing priority files...")
+    for filename in PRIORITY_FILES:
+        if os.path.exists(filename):
+            content = get_file_content(filename)
+            ext = os.path.splitext(filename)[1].replace('.', '')
+            if ext == '': ext = 'text'
+            
+            section = (
+                f"### File: {filename}\n"
+                f"```{ext}\n"
+                f"{content}\n"
+                f"```\n\n"
+                f"---\n\n"
+            )
+            output_content.append(section)
+            processed_files.add(os.path.abspath(filename))
+        else:
+            print(f"Warning: Priority file not found: {filename}")
+
+    # 4. 掃描重點目錄
+    print("Scanning target directories...")
+    for target_dir in TARGET_DIRS:
+        if not os.path.exists(target_dir):
+            continue
+            
+        for root, dirs, files in os.walk(target_dir):
+            # 過濾目錄
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            
+            for file in files:
+                filepath = os.path.join(root, file)
+                abs_path = os.path.abspath(filepath)
+                
+                # 避免重複處理
+                if abs_path in processed_files:
+                    continue
+                    
+                # 檢查副檔名
+                ext = os.path.splitext(file)[1]
+                if ext not in INCLUDED_EXTENSIONS:
+                    continue
+                    
+                # 排除特定檔案
+                if file in EXCLUDED_FILES:
+                    continue
+
+                # 讀取並格式化
+                content = get_file_content(filepath)
+                code_lang = ext.replace('.', '')
+                
+                section = (
+                    f"### File: {filepath}\n"
+                    f"```{code_lang}\n"
+                    f"{content}\n"
+                    f"```\n\n"
+                    f"---\n\n"
+                )
+                output_content.append(section)
+                processed_files.add(abs_path)
+
+    # 5. 寫入最終檔案
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        f.write("".join(output_content))
+    
+    print(f"Done! Context generated at: {OUTPUT_FILE}")
+    print(f"Total size: {os.path.getsize(OUTPUT_FILE) / 1024:.2f} KB")
+
+if __name__ == "__main__":
+    main()

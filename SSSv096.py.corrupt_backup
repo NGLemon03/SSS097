@@ -1,0 +1,2003 @@
+﻿# -*- coding: utf-8 -*-
+"""
+SSSv096.py - ?∠巨蝑蝟餌絞 v0.96
+
+銝餉??嚗?
+1. ?桐?蝑?葫嚗ingle, dual, RMA嚗?
+2. 頧?蝑?葫嚗sma_turn嚗?
+3. 蝯曹??葫獢
+4. 蝮暹???閮?
+5. ?”蝜芾ˊ
+
+雿?SSS Team
+?嚗0.96
+?交?嚗?025-01-12
+"""
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from typing import Dict, List, Tuple, Optional
+import warnings
+import logging
+import subprocess
+try:
+    from analysis.strategy_manager import manager
+except ImportError:
+    manager = None
+# ?蔭 logger - 雿輻??????
+from analysis.logging_config import get_logger, init_logging
+import os
+try:
+    from analysis.strategy_manager import manager
+except ImportError:
+    manager = None # ?脣?
+# 閮剖??啣?霈
+os.environ["SSS_CREATE_LOGS"] = "1"
+
+# ?脣??亥??剁??嗅?頛?
+logger = get_logger("SSS.Core")
+
+def _initialize_core_logging():
+    """???敹頂蝯望隤?""
+    init_logging(enable_file=True)
+    logger.info("=== SSS Core 蝟餌絞?? - 蝯曹??亥?蝟餌絞 ===")
+    return logger
+
+# ?亥?蝟餌絞皞?撠梁?嚗??????
+
+# 敹賜 pandas ??PerformanceWarning
+warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
+
+# ---- Ensemble runner (瘝輻 Dash 撌脤?霅??摩) ----
+from SSS_EnsembleTab import RunConfig, EnsembleParams, CostParams, run_ensemble
+from sss_core.normalize import normalize_trades_for_ui, format_trade_df_for_display, normalize_daily_state
+from sss_core.plotting import dump_equity_cash, dump_timeseries
+
+# ---- ?詨??摩?賣 (蝯曹?敺?sss_core.logic 撠) ----
+from sss_core.logic import (
+    validate_params, load_data, calc_smaa, linreg_last_vectorized,
+    compute_single, compute_dual, compute_RMA, compute_ssma_turn_combined,
+    backtest_unified, calculate_metrics, calculate_holding_periods,
+    calculate_atr, TradeSignal, clear_all_caches, force_update_price_data,
+    BASE_FEE_RATE, TAX_RATE  # 撠鞎餌?撣賊?
+)
+
+__all__ = [
+    "load_data", "compute_single", "compute_dual", "compute_RMA",
+    "compute_ssma_turn_combined", "backtest_unified",
+    "compute_backtest_for_periods", "calculate_metrics",
+]
+VERSION = "096"
+
+# === 蝟餌絞??皞撘澈 ===
+import os
+import json
+import random
+import hashlib
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+# === 鞈?????蝞?===
+import pandas as pd
+import numpy as np
+from scipy.signal import find_peaks
+from joblib import Parallel, delayed
+import textwrap
+
+# === ?航??????垢隞 ===
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+import yfinance as yf
+try:
+    import streamlit as st
+except ModuleNotFoundError:
+    class _Dummy:
+        def __getattr__(self, k): return self
+        def __call__(self, *a, **k): pass
+    st = _Dummy()
+
+
+# === 憿?閮餉圾?極??===
+from typing import Dict, List, Tuple, Optional
+import itertools
+from dataclasses import dataclass, field
+
+def _coerce_trade_schema(df):
+    """瑼Ｘ?臬?閬?頛?寞????璈"""
+    import pandas as pd, numpy as np
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["trade_date","type","price"])
+
+    out = df.copy()
+    out.columns = [str(c).lower() for c in out.columns]
+
+    # trade_date
+    if "trade_date" not in out.columns:
+        if "date" in out.columns:
+            out["trade_date"] = pd.to_datetime(out["date"], errors="coerce")
+        elif isinstance(out.index, pd.DatetimeIndex):
+            out = out.reset_index().rename(columns={"index": "trade_date"})
+        else:
+            out["trade_date"] = pd.NaT
+    else:
+        out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce")
+
+    # type
+    if "type" not in out.columns:
+        if "action" in out.columns:
+            out["type"] = out["action"].astype(str).str.lower()
+        elif "side" in out.columns:
+            out["type"] = out["side"].astype(str).str.lower()
+        elif "dw" in out.columns:
+            out["type"] = np.where(out["dw"]>0, "buy", np.where(out["dw"]<0, "sell", "hold"))
+        else:
+            out["type"] = "hold"
+
+    # price
+    if "price" not in out.columns:
+        for c in ["open","price_open","exec_price","px","close"]:
+            if c in out.columns:
+                out["price"] = out[c]
+                break
+        if "price" not in out.columns:
+            out["price"] = np.nan
+
+    return out.sort_values("trade_date")
+
+# --- 撠?蝯??隤身摰?---
+from analysis import config as cfg
+from analysis.logging_config import init_logging
+import logging
+DATA_DIR = cfg.DATA_DIR
+LOG_DIR = cfg.LOG_DIR
+CACHE_DIR = cfg.CACHE_DIR
+# ?典?鞎餌?撣豢撌脣? sss_core.logic 撠嚗???銴?蝢?
+
+
+# ??蝞?SMAA
+param_presets = {
+
+"Single 2": {"linlen": 90, "factor": 40, "smaalen": 30, "devwin": 30, "buy_mult": 1.45, "sell_mult": 1.25,"stop_loss":0.2, "strategy_type": "single", "smaa_source": "Self"},
+"single_1887": {"linlen": 93, "smaalen": 27, "devwin": 30, "factor": 40, "buy_mult": 1.55, "sell_mult": 0.95, "stop_loss": 0.4, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "single", "smaa_source": "Self"},
+
+"Single 3": {"linlen": 80, "factor": 10, "smaalen": 60, "devwin": 20, "buy_mult": 0.4, "sell_mult": 1.5, "strategy_type": "single", "smaa_source": "Self"},
+"RMA_69": {"linlen": 151, "smaalen": 162, "rma_len": 55, "dev_len": 40, "factor": 40, "buy_mult": 1.4, "sell_mult": 3.15, "stop_loss": 0.1, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Factor (^TWII / 2414.TW)"},
+"RMA_669": {"linlen": 178, "smaalen": 112, "rma_len": 95, "dev_len": 95, "factor": 40, "buy_mult": 1.7, "sell_mult": 0.9, "stop_loss": 0.4, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Self"},
+"STM0": {"linlen": 25, "smaalen": 85, "factor": 80.0, "prom_factor": 9, "min_dist": 8, "buy_shift": 0, "exit_shift": 6, "vol_window": 90, "quantile_win": 65, "signal_cooldown_days": 7, "buy_mult": 0.15, "sell_mult": 0.1, "stop_loss": 0.13, "delta_cap": 0.3,
+                "strategy_type": "ssma_turn", "smaa_source": "Factor (^TWII / 2414.TW)"},
+"STM1": {"linlen": 15,"smaalen": 40,"factor": 40.0,"prom_factor": 70,"min_dist": 10,"buy_shift": 6,"exit_shift": 4,"vol_window": 40,"quantile_win": 65,
+ "signal_cooldown_days": 10,"buy_mult": 1.55,"sell_mult": 2.1,"stop_loss": 0.15,"delta_cap": 0.3,"strategy_type": "ssma_turn","smaa_source": "Self"},
+"STM3": {"linlen": 20,"smaalen": 40,"factor": 40.0,"prom_factor": 69,"min_dist": 10,"buy_shift": 6,"exit_shift": 4,"vol_window": 45,"quantile_win": 55,
+    "signal_cooldown_days": 10,"buy_mult": 1.65,"sell_mult": 2.1,"stop_loss": 0.2,"delta_cap": 0.3,"strategy_type": "ssma_turn","smaa_source": "Self"},
+"STM4": {"linlen": 10,"smaalen": 35,"factor": 40.0,"prom_factor": 68,"min_dist": 8,"buy_shift": 6,"exit_shift": 0,"vol_window": 40,"quantile_win": 65,
+    "signal_cooldown_days": 10,"buy_mult": 1.6,"sell_mult": 2.2,"stop_loss": 0.15,"delta_cap": 0.3,"strategy_type": "ssma_turn","smaa_source": "Factor (^TWII / 2414.TW)"},
+"STM_1939":{'linlen': 20, 'smaalen': 240, 'factor': 40.0, 'prom_factor': 48, 'min_dist': 14, 'buy_shift': 1, 'exit_shift': 1, 'vol_window': 80, 'quantile_win': 175, 'signal_cooldown_days': 4, 'buy_mult': 1.45, 'sell_mult': 2.6, 'stop_loss': 0.2,"delta_cap": 0.3,
+                "strategy_type": "ssma_turn", "smaa_source": "Self"},
+
+"STM_2414_273": {"linlen": 175, "smaalen": 10, "factor": 40.0, "prom_factor": 47, "min_dist": 5, "buy_shift": 0, "exit_shift": 0, "vol_window": 90, "quantile_win": 165, "signal_cooldown_days": 4, "buy_mult": 1.25, "sell_mult": 1.7, "stop_loss": 0.4, "delta_cap": 0.3, "strategy_type": "ssma_turn", "smaa_source": "Factor (^TWII / 2414.TW)"},
+
+# 憭??亦????伐?雿輻撠?蝬脫???芸?敺??嚗?
+"Ensemble_Majority": {
+    "strategy_type": "ensemble",
+    "method": "majority",
+    "params": {
+        "floor": 0.2,  # 摨?靘??桀?=0.2
+        "ema_span": 3,
+        "min_cooldown_days": 1, # 甈?霈??瑕憭拇 ??=1,?桀?=3
+        "delta_cap": 0.3,
+        "min_trade_dw": 0.05, # 甈?霈??撠?瑼???=0.01,?桀?=0.05
+        # "majority_k": 66,   # 120 瑼? ??55% ?瑼鳴?雿活?雿喉?
+        # 嚗?賂??乩?敺??豢?霈?嚗?冽?靘?瑼鳴? "majority_k_pct": 0.55
+    },
+    "trade_cost": {        # ?雿歇蝬璅∠?銝剜?湛??ㄐ??喳
+        "discount_rate": 0.3,
+        "buy_fee_bp": 4.27,
+        "sell_fee_bp": 4.27,
+        "sell_tax_bp": 30.0,
+    },
+    "ticker": "00631L.TW",
+    # === 靽桀儔嚗蝙?冽?靘?瑼駁??N 霈??仃??===
+    "majority_k_pct": 0.55,  # 55% ?瑼鳴???祕???交??矽??
+},
+
+"Ensemble_Proportional": {
+    "strategy_type": "ensemble",
+    "method": "proportional",
+    "params": {
+        "floor": 0.2, # 摨?靘???閮剖?=0.2,?桀?=0.5
+        "ema_span": 3,
+        "min_cooldown_days": 1, # 甈?霈??瑕憭拇 ??閮剖?=1,?桀?=3
+        "delta_cap": 0.2,   # 雿?敺?頛迎??急??研?20瑼??雿?
+        "min_trade_dw": 0.03 # 甈?霈??撠?瑼???閮剖?=0.03,?桀?=0.05
+    },
+    "trade_cost": {
+        "discount_rate": 0.3,
+        "buy_fee_bp": 4.27,
+        "sell_fee_bp": 4.27,
+        "sell_tax_bp": 30.0,
+    },
+    "ticker": "00631L.TW",
+}
+
+}
+
+# ?身?梯???/撘勗 preset嚗??UI 皜?嚗?靽??臬?皞臭蝙?具?LEGACY_PRESET_NAMES = {
+    "Single 2",
+    "single_1887",
+    "Single 3",
+    "RMA_69",
+    "RMA_669",
+    "STM0",
+    "STM1",
+    "STM3",
+    "STM4",
+    "STM_1939",
+    "STM_2414_273",
+}
+for _name in LEGACY_PRESET_NAMES:
+    if _name in param_presets:
+        param_presets[_name]["ui_hidden"] = True
+        param_presets[_name]["preset_tier"] = "legacy"
+
+
+def get_param_preset_names(include_hidden: bool = False) -> List[str]:
+    names: List[str] = []
+    for name, cfg in param_presets.items():
+        if include_hidden or not bool(cfg.get("ui_hidden", False)):
+            names.append(name)
+    return names
+init_logging(enable_file=True)  # ???絞銝?亥?閮剖?
+logger = logging.getLogger("SSS.System")  # 雿輻蝟餌絞 logger
+
+# --- ?啣?嚗nsemble 蝑?內???銝甈～???---
+_ENSEMBLE_MOVED_WARNED = False
+def _warn_ensemble_moved_once():
+    global _ENSEMBLE_MOVED_WARNED
+    if _ENSEMBLE_MOVED_WARNED:
+        return
+    logger.warning("Ensemble 蝑憿?撌脩宏??runners.ensemble_runner嚗?雿輻 app_dash.py ??亥矽??ensemble_runner")
+    logger.info("Ensemble 蝑撌脩宏??runners.ensemble_runner")
+    _ENSEMBLE_MOVED_WARNED = True
+
+
+def _extract_strategy_names(raw_strategies: Optional[List]) -> List[str]:
+    names: List[str] = []
+    for item in (raw_strategies or []):
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+        else:
+            name = str(item).strip()
+        if not name:
+            continue
+        if name.endswith(".csv"):
+            name = name[:-4]
+        names.append(name)
+    return names
+
+
+def _build_ensemble_result(
+    params: Dict,
+    ticker: str,
+    df_raw: pd.DataFrame,
+    strategy_names: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, Dict]:
+    _warn_ensemble_moved_once()
+
+    p = params.get("params", {}) if isinstance(params.get("params", {}), dict) else {}
+    c = params.get("trade_cost", {}) if isinstance(params.get("trade_cost", {}), dict) else {}
+    strategies = strategy_names if strategy_names is not None else list(params.get("strategies", []) or [])
+
+    ens_params = EnsembleParams(
+        floor=float(p.get("floor", 0.2)),
+        ema_span=int(p.get("ema_span", 3)),
+        delta_cap=float(p.get("delta_cap", 0.3)),
+        majority_k=int(p.get("majority_k", 6)),
+        min_cooldown_days=int(p.get("min_cooldown_days", 1)),
+        min_trade_dw=float(p.get("min_trade_dw", 0.05)),
+        delta_cap_buy=(float(p["delta_cap_buy"]) if p.get("delta_cap_buy") is not None else None),
+        delta_cap_sell=(float(p["delta_cap_sell"]) if p.get("delta_cap_sell") is not None else None),
+        enable_asymmetric=bool(p.get("enable_asymmetric", False)),
+    )
+    cost_params = CostParams(
+        discount_rate=float(c.get("discount_rate", 0.3)),
+        buy_fee_bp=float(c.get("buy_fee_bp", 4.27)),
+        sell_fee_bp=float(c.get("sell_fee_bp", 4.27)),
+        sell_tax_bp=float(c.get("sell_tax_bp", 30.0)),
+    )
+    cfg = RunConfig(
+        ticker=str(params.get("ticker", ticker) or ticker),
+        method=str(params.get("method", "proportional")),
+        strategies=strategies,
+        params=ens_params,
+        cost=cost_params,
+    )
+    if params.get("majority_k_pct") is not None:
+        cfg.majority_k_pct = float(params.get("majority_k_pct"))
+
+    open_px, w, trades, stats, method_name, equity, daily_state, trade_ledger = run_ensemble(cfg, price_df=df_raw)
+
+    trade_df = trades.copy() if isinstance(trades, pd.DataFrame) else pd.DataFrame(trades if trades is not None else [])
+    if "trade_date" in trade_df.columns:
+        trade_df["trade_date"] = pd.to_datetime(trade_df["trade_date"], errors="coerce")
+    if "trade_date" in trade_df.columns and not trade_df.empty:
+        trade_df = trade_df.sort_values("trade_date")
+
+    ledger_df = trade_ledger.copy() if isinstance(trade_ledger, pd.DataFrame) else trade_df.copy()
+    if "trade_date" in ledger_df.columns:
+        ledger_df["trade_date"] = pd.to_datetime(ledger_df["trade_date"], errors="coerce")
+        ledger_df = ledger_df.sort_values("trade_date")
+
+    if not trade_df.empty and {"trade_date", "type", "price"}.issubset(trade_df.columns):
+        signals_df = trade_df[["trade_date", "type", "price"]].rename(columns={"type": "action"}).copy()
+    else:
+        signals_df = pd.DataFrame(columns=["trade_date", "action", "price"])
+
+    if isinstance(open_px, pd.Series) and not open_px.empty:
+        ind_index = open_px.index
+    elif isinstance(df_raw, pd.DataFrame) and not df_raw.empty:
+        ind_index = df_raw.index
+    else:
+        ind_index = pd.Index([])
+
+    if isinstance(df_raw, pd.DataFrame) and "close" in df_raw.columns:
+        smaa_series = pd.to_numeric(df_raw["close"], errors="coerce")
+    elif isinstance(df_raw, pd.DataFrame) and "Close" in df_raw.columns:
+        smaa_series = pd.to_numeric(df_raw["Close"], errors="coerce")
+    elif isinstance(open_px, pd.Series):
+        smaa_series = pd.to_numeric(open_px, errors="coerce")
+    else:
+        smaa_series = pd.Series(dtype=float)
+
+    df_ind = pd.DataFrame(index=ind_index)
+    df_ind["smaa"] = smaa_series.reindex(ind_index) if isinstance(smaa_series, pd.Series) else np.nan
+    if isinstance(open_px, pd.Series):
+        df_ind["smaa"] = df_ind["smaa"].fillna(open_px.reindex(df_ind.index))
+
+    result = {
+        "trades": [],
+        "trade_df": trade_df,
+        "trades_df": trade_df.copy(),
+        "signals_df": signals_df,
+        "metrics": stats if isinstance(stats, dict) else {},
+        "equity_curve": equity if isinstance(equity, pd.Series) else pd.Series(dtype=float),
+        "daily_state": daily_state if isinstance(daily_state, pd.DataFrame) else pd.DataFrame(),
+        "weight_curve": w if isinstance(w, pd.Series) else pd.Series(dtype=float),
+        "trade_ledger": ledger_df,
+        "method_name": method_name,
+    }
+    return df_ind, result
+
+from functools import wraps
+
+# ===============================================================================
+# ?? ??隞?Ⅳ撌脩宏????
+# 隞乩??賣撌脣? sss_core.logic 撠嚗??辣?嚗?
+# - TradeSignal, validate_params, load_data, calc_smaa, linreg_last_vectorized
+# - compute_single, compute_dual, compute_RMA, compute_ssma_turn_combined
+# - backtest_unified, calculate_metrics, calculate_holding_periods, calculate_atr
+#
+# ??隞?Ⅳ蝝?1146 銵歇?芷嚗???Ｗ儔隢蝙?函??祆?嗥頂蝯?
+# ===============================================================================
+
+# --- SSSv096 撠???拙??---
+
+def compute_backtest_for_periods(
+    ticker: str,
+    periods: List[Tuple[str, str]],
+    strategy_type: str,
+    params: Dict,
+    smaa_source: str = "Self",
+    trade_cooldown_bars: int = 3,
+    discount: float = 0.30,
+    bad_holding: bool = False,
+    df_price: Optional[pd.DataFrame] = None,
+    df_factor: Optional[pd.DataFrame] = None,
+) -> List[Dict]:
+    """
+    Run backtests over multiple periods.
+    """
+    results = []
+    df_price_src = df_price
+    df_factor_src = df_factor
+    for start_date, end_date in periods:
+        logger.info(f"Backtest period: {start_date} -> {end_date}")
+
+        if df_price_src is None or df_factor_src is None:
+            df_raw, df_factor_slice = load_data(ticker, start_date, end_date, smaa_source)
+        else:
+            # Use direct label slicing to avoid false-empty from non-exact boundaries.
+            df_raw = df_price_src.loc[start_date:end_date].copy()
+            if df_factor_src is not None and not df_factor_src.empty:
+                df_factor_slice = df_factor_src.loc[start_date:end_date].copy()
+            else:
+                df_factor_slice = pd.DataFrame()
+
+        logger.info(
+            "slice summary start=%s end=%s raw_len=%d factor_len=%d",
+            start_date,
+            end_date,
+            len(df_raw),
+            len(df_factor_slice),
+        )
+
+        if df_raw.empty:
+            logger.warning(f"Period {start_date} -> {end_date} has empty price data")
+            results.append({
+                'trades': [],
+                'trade_df': pd.DataFrame(),
+                'signals_df': pd.DataFrame(),
+                'metrics': {'total_return': -np.inf, 'num_trades': 0},
+                'period': {'start_date': start_date, 'end_date': end_date}
+            })
+            continue
+
+        if strategy_type == 'ssma_turn':
+            calc_keys = [
+                'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                'buy_shift', 'exit_shift', 'vol_window', 'quantile_win', 'signal_cooldown_days',
+                'volume_target_pass_rate', 'volume_target_lookback'
+            ]
+            ssma_params = {k: v for k, v in params.items() if k in calc_keys}
+            df_ind, buy_dates, sell_dates = compute_ssma_turn_combined(df_raw, df_factor_slice, **ssma_params)
+            if df_ind.empty:
+                logger.warning(f"{strategy_type} indicator dataframe is empty")
+                results.append({
+                    'trades': [],
+                    'trade_df': pd.DataFrame(),
+                    'signals_df': pd.DataFrame(),
+                    'metrics': {'total_return': -np.inf, 'num_trades': 0},
+                    'period': {'start_date': start_date, 'end_date': end_date}
+                })
+                continue
+            result = backtest_unified(
+                df_ind,
+                strategy_type,
+                params,
+                buy_dates,
+                sell_dates,
+                discount=discount,
+                trade_cooldown_bars=trade_cooldown_bars,
+                bad_holding=bad_holding,
+            )
+        else:
+            if strategy_type == 'single':
+                df_ind = compute_single(df_raw, df_factor_slice, params['linlen'], params['factor'], params['smaalen'], params['devwin'])
+            elif strategy_type == 'dual':
+                df_ind = compute_dual(df_raw, df_factor_slice, params['linlen'], params['factor'], params['smaalen'], params['short_win'], params['long_win'])
+            elif strategy_type == 'RMA':
+                df_ind = compute_RMA(df_raw, df_factor_slice, params['linlen'], params['factor'], params['smaalen'], params['rma_len'], params['dev_len'])
+            else:
+                df_ind = pd.DataFrame()
+            if df_ind.empty:
+                logger.warning(f"{strategy_type} indicator dataframe is empty")
+                results.append({
+                    'trades': [],
+                    'trade_df': pd.DataFrame(),
+                    'signals_df': pd.DataFrame(),
+                    'metrics': {'total_return': -np.inf, 'num_trades': 0},
+                    'period': {'start_date': start_date, 'end_date': end_date}
+                })
+                continue
+            result = backtest_unified(df_ind, strategy_type, params, discount=discount, trade_cooldown_bars=trade_cooldown_bars, bad_holding=bad_holding)
+
+        result['period'] = {'start_date': start_date, 'end_date': end_date}
+        results.append(result)
+
+    return results
+# --- ?啣?嚗??車鈭斗??澆?頧??怠?閬?蝯曹?閬 ---
+# --- 雿輻?祆??折摰儔??皞??賢? ---
+
+def normalize_trades_for_plots(
+    trades: pd.DataFrame,
+    price_series: Optional[pd.Series] = None,   # ?啣?嚗?賂?
+) -> pd.DataFrame:
+    """
+    璅??漱????潛鼓??靽????雿?
+    ??trades 蝻?price 甈?銝?靘? price_series嚗?靘?trade_date 撠?鋆??
+    """
+    if trades is None or len(trades) == 0:
+        return pd.DataFrame()
+    
+    trades_plot = trades.copy()
+    trades_plot.columns = [str(c).lower() for c in trades_plot.columns]
+    
+    # trade_date / type 璅???
+    if "trade_date" not in trades_plot.columns and "date" in trades_plot.columns:
+        trades_plot["trade_date"] = pd.to_datetime(trades_plot["date"], errors="coerce")
+    if "type" not in trades_plot.columns and "action" in trades_plot.columns:
+        trades_plot["type"] = trades_plot["action"].astype(str).str.lower()
+    
+    # price 璅?????撣貉?甈?嚗甈∠ price_series 撠?鋆
+    if "price" not in trades_plot.columns:
+        for c in ["open", "price_open", "exec_price", "px", "close"]:
+            if c in trades_plot.columns:
+                trades_plot["price"] = trades_plot[c]
+                break
+    
+    if "price" not in trades_plot.columns:
+        trades_plot["price"] = pd.NA  # ?? NA嚗蝑???price_series ??朣?
+    
+    if price_series is not None:
+        # 蝣箔??拚? index/??賢?朣?
+        ps = price_series.copy()
+        if not isinstance(ps.index, pd.DatetimeIndex):
+            ps.index = pd.to_datetime(ps.index, errors="coerce")
+        # 隞?trade_date 撠?鋆嚗???price ?箇征???嚗?
+        if "trade_date" in trades_plot.columns:
+            td = pd.to_datetime(trades_plot["trade_date"], errors="coerce")
+            aligned = ps.reindex(td).reset_index(drop=True)
+            # ?芸‵????桀???NA ??
+            need_fill = trades_plot["price"].isna() | ~pd.to_numeric(trades_plot["price"], errors="coerce").notna()
+            trades_plot.loc[need_fill, "price"] = aligned[need_fill].values
+    
+    return trades_plot
+
+# --- ?航????---
+def plot_stock_price(df: pd.DataFrame, trades_df: pd.DataFrame, ticker: str) -> go.Figure:
+    """
+    蝜芾ˊ?∠巨?寞?眺鞈?縑??
+    
+    Args:
+        df (pd.DataFrame): ?寞?豢?,? close 甈?.
+        trades_df (pd.DataFrame): 鈭斗?閮?,? trade_date, type, price.
+        ticker (str): ?∠巨隞??.
+    
+    Returns:
+        go.Figure: Plotly ?”?拐辣.
+    """
+    # ???澆?鈭斗?鞈?嚗Ⅱ靽?蝯曹???trade_date + type + price 甈?
+    trades_df = normalize_trades_for_plots(trades_df, price_series=df.get("open", df["close"]))
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['close'], name='Close Price', line=dict(color='dodgerblue')))
+    
+    if not trades_df.empty:
+        # ?曉 trades_df 撌脩??絞銝??trade_date + type + price 甈?
+        buys = trades_df[trades_df['type'] == 'buy']
+        adds = trades_df[trades_df['type'] == 'add'] if 'add' in trades_df['type'].values else pd.DataFrame()
+
+        # ? ??迤撣貉都?箄?撘瑕撟喳?
+        all_sells = trades_df[trades_df['type'].str.contains('sell', case=False, na=False)]
+        normal_sells = all_sells[~all_sells['type'].str.contains('forced', case=False, na=False)]
+        forced_sells = all_sells[all_sells['type'].str.contains('forced', case=False, na=False)]
+
+        # 蝜芾ˊ鞎瑕靽∟?
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys['trade_date'],
+                y=buys['price'],
+                mode='markers',
+                name='Buy',
+                marker=dict(symbol='cross', size=10, color='green')
+            ))
+
+        # 蝜芾ˊ?Ⅳ靽∟?
+        if not adds.empty:
+            fig.add_trace(go.Scatter(
+                x=adds['trade_date'],
+                y=adds['price'],
+                mode='markers',
+                name='Add-On Buy',
+                marker=dict(symbol='cross', size=10, color='limegreen')
+            ))
+
+        # 蝜芾ˊ甇?虜鞈?靽∟?嚗??乩縑??
+        if not normal_sells.empty:
+            fig.add_trace(go.Scatter(
+                x=normal_sells['trade_date'],
+                y=normal_sells['price'],
+                mode='markers',
+                name='Sell',
+                marker=dict(symbol='x', size=10, color='red')
+            ))
+
+        # ? 蝜芾ˊ撘瑕撟喳??葫蝯?嚗?
+        if not forced_sells.empty:
+            fig.add_trace(go.Scatter(
+                x=forced_sells['trade_date'],
+                y=forced_sells['price'],
+                mode='markers',
+                name='End Valid (Forced)',
+                marker=dict(symbol='square', size=8, color='gray')
+            ))
+    
+    fig.update_layout(title=f'{ticker} ?∪?漱?縑??,
+                      xaxis_title='?交?', yaxis_title='?寞', template='plotly_white')
+    return fig
+
+def plot_indicators(df_ind: pd.DataFrame, strategy_type: str, trades_df: pd.DataFrame, params: Dict) -> go.Figure:
+    fig = go.Figure()
+    if strategy_type in ['single', 'dual', 'RMA']:
+        fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['smaa'], name='SMAA', line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['base'], name='Base', line=dict(color='orange')))
+        fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['base'] + df_ind['sd'] * params['buy_mult'], name='Buy Level',
+                                 line=dict(color='green', dash='dash')))
+        fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['base'] + df_ind['sd'] * params['sell_mult'], name='Sell Level',
+                                 line=dict(color='red', dash='dash')))
+        if 'base_long' in df_ind.columns:
+            fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['base_long'], name='Base Long', line=dict(color='purple', dash='dot')))
+    else:  # ssma_turn
+        fig.add_trace(go.Scatter(x=df_ind.index, y=df_ind['smaa'], name='SMAA', line=dict(color='blue')))
+
+    # ???澆?鈭斗?鞈?嚗Ⅱ靽?蝯曹???trade_date + type + price 甈?
+    trades_df = normalize_trades_for_plots(trades_df, price_series=df_ind.get("smaa"))
+
+    buys = trades_df[trades_df['type'] == 'buy']
+
+    # ? ??迤撣貉都?箄?撘瑕撟喳?
+    all_sells = trades_df[trades_df['type'].str.contains('sell', case=False, na=False)]
+    normal_sells = all_sells[~all_sells['type'].str.contains('forced', case=False, na=False)]
+    forced_sells = all_sells[all_sells['type'].str.contains('forced', case=False, na=False)]
+
+    if not buys.empty:
+        fig.add_trace(go.Scatter(x=buys['trade_date'], y=df_ind['smaa'].reindex(buys['trade_date']).values, mode='markers', name='Buy Signal',
+                                 marker=dict(symbol='cross', size=10, color='green')))
+    if not normal_sells.empty:
+        fig.add_trace(go.Scatter(x=normal_sells['trade_date'], y=df_ind['smaa'].reindex(normal_sells['trade_date']).values, mode='markers', name='Sell Signal',
+                                 marker=dict(symbol='x', size=10, color='red')))
+    # ? 撘瑕撟喳??啗?孵?嚗?
+    if not forced_sells.empty:
+        fig.add_trace(go.Scatter(x=forced_sells['trade_date'], y=df_ind['smaa'].reindex(forced_sells['trade_date']).values, mode='markers', name='End Valid (Forced)',
+                                 marker=dict(symbol='square', size=8, color='gray')))
+
+    fig.update_layout(title='SMAA??',
+                      xaxis_title='Date', yaxis_title='Value', template='plotly_white')
+    return fig
+
+def plot_equity_cash(trades_or_ds: pd.DataFrame, df_raw: pd.DataFrame | None = None) -> go.Figure:
+    """
+    ?芸??亙???['equity','cash'] 甈???daily_state??
+    ?亙?脖??鈭斗?銵剁?瘝? equity/cash嚗???閰衣鈭斗??遣??
+    
+    Args:
+        trades_or_ds: 瘥???DataFrame ?漱?” DataFrame
+        df_raw: ?寞?豢? DataFrame嚗?潮?撱箸??蝺?
+    
+    Returns:
+        go.Figure: Plotly ?”?拐辣
+    """
+    if isinstance(trades_or_ds, pd.DataFrame) and {'equity','cash'}.issubset(trades_or_ds.columns):
+        # ?芸?雿輻 daily_state
+        ds = trades_or_ds.copy()
+        if not np.issubdtype(ds.index.dtype, np.datetime64):
+            ds.index = pd.to_datetime(ds.index)
+        ds = ds.sort_index()
+        
+        # 隞?daily_state ?湔?怠?????甈∪瑼?靽
+        if 'position_value' in ds.columns:
+            try:
+                corr = pd.Series(ds['equity']).corr(pd.Series(ds['cash']))
+                looks_like_position_value = (corr is not None and corr < -0.95)
+                if looks_like_position_value:
+                    eq_fixed = ds['position_value'] + ds['cash']
+                    ds = ds.copy()
+                    ds['equity'] = eq_fixed  # ?芸?蝟曉?
+            except Exception:
+                pass
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=ds.index, y=ds['equity'], name='Equity', line=dict(color='dodgerblue')))
+        fig.add_trace(go.Scatter(x=ds.index, y=ds['cash'],   name='Cash',   line=dict(color='gray')))
+        fig.update_layout(title='甈? & ?暸?', xaxis_title='?交?', yaxis_title='??', template='plotly_white')
+        return fig
+    else:
+        # ?楝敺?鈭斗?銵???璅????遣嚗nsemble ?漱?”?虜蝻?shares嚗?靽???嚗?
+        try:
+            trades_df = normalize_trades_for_plots(trades_or_ds)
+            ds = reconstruct_equity_cash_from_trades(trades_df, df_raw)  # 雿???遣?摩
+            
+            # 靽?甈?
+            for col in ['equity', 'cash']:
+                if col not in ds.columns:
+                    raise KeyError(f"daily_state 蝻箏?敹?甈?: {col}")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=ds.index, y=ds['equity'], name='Equity', line=dict(color='dodgerblue')))
+            fig.add_trace(go.Scatter(x=ds.index, y=ds['cash'],   name='Cash',   line=dict(color='gray')))
+            title = '甈? & ?暸?'
+            if 'recon_mode' in ds.columns and not ds.empty:
+                recon_mode = str(ds['recon_mode'].iloc[-1])
+                if recon_mode == 'estimated_fixed_qty':
+                    title = '甈? & ?暸? (Estimated quantity - not for performance decisions)'
+            fig.update_layout(title=title, xaxis_title='?交?', yaxis_title='??', template='plotly_white')
+            return fig
+        except Exception as e:
+            logger.warning(f"?⊥?敺漱?”?遣甈??脩?: {e}")
+            return go.Figure()
+
+
+def plot_weight_series(daily_state: pd.DataFrame, trades_df: pd.DataFrame = None) -> go.Figure:
+    """
+    蝜芾ˊ??甈?霈???銝行?蝷箄???
+    
+    Args:
+        daily_state: 瘥???DataFrame嚗??甈??賊?甈?
+        trades_df: 鈭斗?鞈? DataFrame嚗?潭?蝷箄???嚗?賂?
+    
+    Returns:
+        go.Figure: Plotly ?”?拐辣
+    """
+    ds = daily_state.copy()
+    if not isinstance(ds.index, pd.DatetimeIndex):
+        ds.index = pd.to_datetime(ds.index, errors='coerce')
+    ds = ds.sort_index()
+
+    # ?芸???嚗 ??invested_pct ??cash_pct嚗 1 - cash_pct嚗?
+    if 'w' in ds.columns:
+        w = ds['w']
+    elif 'invested_pct' in ds.columns:
+        w = ds['invested_pct']
+    elif 'cash_pct' in ds.columns:
+        w = 1 - ds['cash_pct']
+    else:
+        return go.Figure()  # ?∪?冽?雿??蝛箏?
+
+    fig = go.Figure()
+    
+    # 銝餉?甈??脩?
+    fig.add_trace(go.Scatter(
+        x=w.index, 
+        y=w, 
+        name='??甈?',
+        line=dict(color='dodgerblue', width=2),
+        mode='lines'
+    ))
+    
+    # 憒??漱????璅內霈?暺?
+    if trades_df is not None and not trades_df.empty:
+        # 蝣箔?鈭斗?鞈???閬?甈?
+        if 'trade_date' in trades_df.columns and 'type' in trades_df.columns:
+            # ?蕪???漱???
+            valid_trades = trades_df[
+                (trades_df['trade_date'].notna()) & 
+                (trades_df['trade_date'].isin(w.index))
+            ].copy()
+            
+            if not valid_trades.empty:
+                # 撠漱????datetime
+                valid_trades['trade_date'] = pd.to_datetime(valid_trades['trade_date'])
+                
+                # ?箸?蝑漱??啣???甈???
+                trade_points = []
+                for _, trade in valid_trades.iterrows():
+                    trade_date = trade['trade_date']
+                    if trade_date in w.index:
+                        weight_value = w.loc[trade_date]
+                        trade_type = trade['type']
+                        
+                        # ?寞?鈭斗?憿?瘙箏?璅?璅??
+                        if trade_type in ('buy', 'add'):
+                            marker_symbol = 'triangle-up'
+                            marker_color = 'green'
+                            marker_size = 10
+                        elif trade_type == 'sell':
+                            marker_symbol = 'triangle-down'
+                            marker_color = 'red'
+                            marker_size = 10
+                        else:
+                            marker_symbol = 'circle'
+                            marker_color = 'orange'
+                            marker_size = 8
+                        
+                        trade_points.append({
+                            'date': trade_date,
+                            'weight': weight_value,
+                            'type': trade_type,
+                            'symbol': marker_symbol,
+                            'color': marker_color,
+                            'size': marker_size
+                        })
+                
+                # 瘛餃?霈?暺?閮?
+                if trade_points:
+                    # 鞎瑕/?Ⅳ暺?
+                    buy_points = [p for p in trade_points if p['type'] in ('buy', 'add')]
+                    if buy_points:
+                        fig.add_trace(go.Scatter(
+                            x=[p['date'] for p in buy_points],
+                            y=[p['weight'] for p in buy_points],
+                            mode='markers',
+                            name='鞎瑕/?Ⅳ',
+                            marker=dict(
+                                symbol='triangle-up',
+                                size=10,
+                                color='green',
+                                line=dict(width=1, color='darkgreen')
+                            ),
+                            hovertemplate='<b>鞎瑕/?Ⅳ</b><br>?交?: %{x}<br>甈?: %{y:.4f}<extra></extra>'
+                        ))
+                    
+                    # 鞈?暺?
+                    sell_points = [p for p in trade_points if p['type'] == 'sell']
+                    if sell_points:
+                        fig.add_trace(go.Scatter(
+                            x=[p['date'] for p in sell_points],
+                            y=[p['weight'] for p in sell_points],
+                            mode='markers',
+                            name='鞈?',
+                            marker=dict(
+                                symbol='triangle-down',
+                                size=10,
+                                color='red',
+                                line=dict(width=1, color='darkred')
+                            ),
+                            hovertemplate='<b>鞈?</b><br>?交?: %{x}<br>甈?: %{y:.4f}<extra></extra>'
+                        ))
+                    
+                    # ?嗡?憿?鈭斗?暺?
+                    other_points = [p for p in trade_points if p['type'] not in ('buy', 'add', 'sell')]
+                    if other_points:
+                        fig.add_trace(go.Scatter(
+                            x=[p['date'] for p in other_points],
+                            y=[p['weight'] for p in other_points],
+                            mode='markers',
+                            name='?嗡?鈭斗?',
+                            marker=dict(
+                                symbol='circle',
+                                size=8,
+                                color='orange',
+                                line=dict(width=1, color='darkorange')
+                            ),
+                            hovertemplate='<b>?嗡?鈭斗?</b><br>?交?: %{x}<br>甈?: %{y:.4f}<extra></extra>'
+                        ))
+    
+    # ?湔?”雿?
+    fig.update_layout(
+        title='??甈?霈?',
+        xaxis_title='?交?',
+        yaxis_title='甈?(0~1)',
+        template='plotly_white',
+        yaxis=dict(range=[0, 1]),
+        hovermode='x unified',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    return fig
+
+def reconstruct_equity_cash_from_trades(trades_df: pd.DataFrame, df_raw: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Reconstruct equity and cash curves from trades.
+
+    Priority:
+    1) Use explicit quantity columns (shares/qty/quantity) when present.
+    2) Fall back to fixed quantity estimation.
+    """
+    if trades_df is None or trades_df.empty or df_raw is None or df_raw.empty:
+        return pd.DataFrame()
+
+    required_cols = ['trade_date', 'type', 'price']
+    if not all(col in trades_df.columns for col in required_cols):
+        logger.warning(f"Trade dataframe missing required columns: {required_cols}")
+        return pd.DataFrame()
+
+    dates = pd.DatetimeIndex(df_raw.index)
+    initial_cash = 1_000_000.0
+    cash_series = pd.Series(initial_cash, index=dates, dtype=float)
+    shares_series = pd.Series(0.0, index=dates, dtype=float)
+
+    trades_df = trades_df.copy()
+    trades_df['trade_date'] = pd.to_datetime(trades_df['trade_date'], errors='coerce')
+    trades_df['price'] = pd.to_numeric(trades_df['price'], errors='coerce')
+    trades_df['type'] = trades_df['type'].astype(str).str.lower().str.strip()
+
+    qty_col = next((c for c in ['shares', 'qty', 'quantity'] if c in trades_df.columns), None)
+    recon_mode = 'actual_qty' if qty_col is not None else 'estimated_fixed_qty'
+
+    if qty_col is not None:
+        trades_df['trade_qty'] = pd.to_numeric(trades_df[qty_col], errors='coerce').abs()
+    else:
+        trades_df['trade_qty'] = np.nan
+
+    for _, row in trades_df.iterrows():
+        dt = row['trade_date']
+        px = row['price']
+        t_type = row['type']
+
+        if pd.isna(dt) or pd.isna(px) or dt not in dates:
+            continue
+
+        if recon_mode == 'actual_qty':
+            qty = row['trade_qty']
+            if pd.isna(qty) or qty <= 0:
+                continue
+            shares = float(qty)
+        else:
+            shares = 1000.0
+
+        if t_type in ('buy', 'add', 'entry', 'long'):
+            shares_series.loc[dt:] += shares
+            cash_series.loc[dt:] -= shares * px
+        elif t_type in ('sell', 'exit', 'sell_forced', 'forced_sell', 'short'):
+            current_shares = float(shares_series.loc[dt])
+            if recon_mode == 'actual_qty':
+                shares_to_sell = min(current_shares, shares)
+                shares_series.loc[dt:] -= shares_to_sell
+                cash_series.loc[dt:] += shares_to_sell * px
+            else:
+                shares_to_sell = current_shares
+                shares_series.loc[dt:] = 0.0
+                cash_series.loc[dt:] += shares_to_sell * px
+
+    close_col = 'close' if 'close' in df_raw.columns else 'Close'
+    if close_col not in df_raw.columns:
+        logger.warning('Price dataframe missing close/Close column for reconstruction')
+        return pd.DataFrame()
+
+    equity_series = cash_series + shares_series * pd.to_numeric(df_raw[close_col], errors='coerce')
+
+    result = pd.DataFrame({
+        'equity': equity_series,
+        'cash': cash_series,
+        'recon_mode': recon_mode,
+    })
+
+    return result
+def display_metrics_flex(metrics: dict):
+    """
+    撠?metrics ???貉ㄐ?Ｙ? (???????詨? 頧? HTML Flexbox ?澆??芸?????＊蝷?
+    """
+    # ?? metrics ??key/value 頧??＊蝷箇??label???撘?敺? value 摮葡??
+    items = []
+    for k, v in metrics.items():
+        # 靘? k 瘙箏?閬?閬誑?曉?瘥?撠??蝝?摮??澆???
+        if k in ["total_return", "annual_return", "win_rate", "max_drawdown", "annualized_volatility", "avg_win", "avg_loss"]:
+            txt = f"{v:.2%}" if pd.notna(v) else ""
+        elif k in ["calmar_ratio", "sharpe_ratio", "sortino_ratio", "payoff_ratio", "profit_factor"]:
+            txt = f"{v:.2f}" if pd.notna(v) else ""
+        elif k in ["max_drawdown_duration", "avg_holding_period"]:
+            txt = f"{v:.1f} 憭? if pd.notna(v) else ""
+        elif k in ["num_trades", "max_consecutive_wins", "max_consecutive_losses"]:
+            txt = str(int(v)) if pd.notna(v) else ""
+        else:
+            # ?嗡?撠勗??⊿??嗥???憿舐內
+            txt = f"{v}"
+        # ????key ??銝剜?憿舐內 label
+        label_map = {
+            "total_return": "蝮賢??梁?",
+            "annual_return": "撟游????,
+            "win_rate": "??",
+            "max_drawdown": "?憭批???,
+            "max_drawdown_duration": "???",
+            "calmar_ratio": "?∠瘥?",
+            "sharpe_ratio": "憭瘥?",
+            "sortino_ratio": "蝝Ｘ?隢暹???,
+            "payoff_ratio": "?瘥?,
+            "profit_factor": "???",
+            "num_trades": "鈭斗?甈⊥",
+            "avg_holding_period": "撟喳??予??,
+            "annualized_volatility": "撟游?瘜Ｗ???,
+            "max_consecutive_wins": "?憭折???",
+            "max_consecutive_losses": "?憭折???扳?",
+            "avg_win": "撟喳??",
+            "avg_loss": "撟喳??扳?",
+        }
+        label = label_map.get(k, k)
+        items.append((label, txt))
+
+    # ???Ｙ? HTML:憭惜銝??flex container,?批惜瘥?(??+?詨? ?賣 flex item
+    html = """
+<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start;">
+"""
+    for label, val in items:
+        html += f"""
+  <div style="flex:0 1 150px;border:1px solid #444;border-radius:4px;padding:8px 12px;background:#1a1a1a;">
+    <div style="font-size:14px;color:#aaa;">{label}</div>
+    <div style="font-size:20px;font-weight:bold;color:#fff;margin-top:4px;">{val}</div>
+  </div>
+"""
+    html += "</div>"
+
+    # ?餅?憭?蝮格?,?踹??蝛箇鋡怨圾霈??code block
+    html = textwrap.dedent(html)
+
+    st.markdown(html, unsafe_allow_html=True)
+
+def display_strategy_summary(strategy: str, params: Dict, metrics: Dict, smaa_source: str, trade_df: pd.DataFrame):
+    """
+    憿舐內蝑???皜祉蜀??閬?雿輻 HTML Flexbox ?∠?撅內.
+    """
+    # ?撅內
+    param_display = {k: v for k, v in params.items() if k != "strategy_type"}
+    st.write("**?閮剖?**: " + ", ".join(f"{k}: {v}" for k, v in param_display.items()))
+
+    # 閮?撟喳??予??
+    avg_holding_period = calculate_holding_periods(trade_df)
+
+    # 撠像???予?詨???metrics
+    metrics['avg_holding_period'] = avg_holding_period
+
+    # 蝮暹???撅內
+    if metrics:
+        display_metrics_flex(metrics)
+    else:
+        st.warning("撠?瑁??葫,?⊥?憿舐內蝮暹???.")
+# --- 銝餅??函?撘?---
+def run_app():
+    st.set_page_config(layout="wide")
+    st.sidebar.title("00631L蝑蝟餌絞")    
+    page = st.sidebar.selectbox("?? ?撠", ["蝑?葫", "??蝯?甈???", "???祆窒?拍???, "敹怠?蝞∠?", "瘥閮??葫"])
+
+    try:
+        from version_history import get_version_history_html
+        if page == "???祆窒?拍???:
+            html = get_version_history_html()
+            st.markdown(html, unsafe_allow_html=True)
+            return
+    except ImportError:
+        st.warning("?⊥?頛?甇瑕閮?,隢Ⅱ靽?version_history.py 摮.")
+        if page == "???祆窒?拍???:
+            st.markdown("")
+            return
+
+    # 敹怠?蝞∠??
+    if page == "敹怠?蝞∠?":
+        st.title("敹怠?蝞∠?")
+        st.write("蝞∠?蝟餌絞敹怠???寞???)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("皜敹怠?")
+            if st.button("??儭?皜??翰??):
+                if clear_all_caches():
+                    st.success("????翰?歇皜")
+                else:
+                    st.error("??皜敹怠?憭望?")
+            
+            st.write("**皜?批捆?嚗?*")
+            st.write("- Joblib 閮?敹怠?")
+            st.write("- SMAA ??敹怠?")
+            st.write("- Optuna 甈??脩?敹怠?")
+        
+        with col2:
+            st.subheader("?∪?豢??湔")
+            ticker_to_update = st.selectbox(
+                "?豢?閬?啁??∠巨嚗?,
+                ["?券?湔", "00631L.TW", "^TWII", "2414.TW", "2412.TW"],
+                index=0
+            )
+            
+            if st.button("?? 撘瑕?湔?∪"):
+                if ticker_to_update == "?券?湔":
+                    success = force_update_price_data()
+                else:
+                    success = force_update_price_data(ticker_to_update)
+                
+                if success:
+                    st.success(f"??{ticker_to_update} ?∪?豢?撌脫??)
+                else:
+                    st.error(f"??{ticker_to_update} ?∪?豢??湔憭望?")
+        
+        st.subheader("敹怠????)
+        cache_info = []
+        
+        # 瑼Ｘ??敹怠?
+        try:
+            # Joblib 敹怠?
+            joblib_cache_size = len(list(cfg.MEMORY.store_backend.get_items()))
+            cache_info.append(f"Joblib 敹怠?: {joblib_cache_size} ????)
+        except Exception:
+            cache_info.append("Joblib 敹怠?: ?⊥?瑼Ｘ")
+        
+        # SMAA 敹怠?
+        smaa_cache_dir = CACHE_DIR / "cache_smaa"
+        if smaa_cache_dir.exists():
+            smaa_files = len(list(smaa_cache_dir.glob("*.joblib")))
+            cache_info.append(f"SMAA 敹怠?: {smaa_files} ??獢?)
+        else:
+            cache_info.append("SMAA 敹怠?: ?桅?銝???)
+        
+        # Optuna 敹怠?
+        optuna_cache_dir = CACHE_DIR / "optuna16_equity"
+        if optuna_cache_dir.exists():
+            optuna_files = len(list(optuna_cache_dir.glob("*.npy")))
+            cache_info.append(f"Optuna 敹怠?: {optuna_files} ??獢?)
+        else:
+            cache_info.append("Optuna 敹怠?: ?桅?銝???)
+        
+        for info in cache_info:
+            st.write(f"??{info}")
+        
+        return
+
+    # ??蝯?甈????
+    if page == "??蝯?甈???":
+        st.title("?? ??蝯?甈???")
+        st.write("??憭??交?鞈???甈????蜀?”??)
+        
+        # ?湧?甈身摰?
+        st.sidebar.header("??蝯?閮剖?")
+        
+        # ?豢?蝑
+        show_legacy_combo = st.sidebar.checkbox("憿舐內???身", value=False, key="show_legacy_combo")
+        strategy_names = get_param_preset_names(include_hidden=show_legacy_combo)
+        if not strategy_names:
+            st.warning("?桀?瘝??舐??閮剔??乓?)
+            return
+        selected_strategies = st.sidebar.multiselect(
+            "?豢?蝑蝯?:",
+            strategy_names,
+            default=strategy_names[:5]  # ?身?豢???????
+        )
+        
+        if not selected_strategies:
+            st.warning("隢撠??????)
+            return
+        
+        # 甈????寞?
+        weight_method = st.sidebar.selectbox(
+            "甈????寞?:",
+            ["蝑???, "憭瘥?甈?", "?孵榆?甈?", "??隤踵"],
+            index=0
+        )
+        
+        # ?撟唾﹛?餌?
+        rebalance_freq = st.sidebar.selectbox(
+            "?撟唾﹛?餌?:",
+            ["摮?漲", "撟游漲", "銝??啣像銵?],
+            index=1
+        )
+        
+        # ????
+        lookback_period = st.sidebar.slider(
+            "???? (鈭斗???:",
+            min_value=60,
+            max_value=504,  # 蝝?撟?
+            value=252,  # 蝝?撟?
+            step=21
+        )
+        
+        # ?箸閮剖?
+        ticker = st.sidebar.selectbox("?∠巨隞??:", ["00631L.TW", "2330.TW", "00663L.TW", "00663L.TW", "00675L.TW", "00685L.TW"], index=0)
+        start_date = st.sidebar.text_input("韏瑕??交?:", "2010-01-01")
+        end_date = st.sidebar.text_input("蝯??交?:", "")
+        discount = st.sidebar.slider("?詨??:", min_value=0.1, max_value=0.70, value=0.30, step=0.01)
+        
+        # ?瑁?????
+        run_analysis = st.sidebar.button("?? ?瑁???蝯???")
+    # ? ?啣????Ｙ??摩
+
+
+    if page == "瘥閮??葫":
+        st.title("? SSS096 瘥???唳?摰?)
+        st.caption("?芸??????葦蝑嚗?靘??仿??斗?雿遣霅?)
+
+        history_file = Path("analysis/signal_history.csv")
+
+        # --- ?瑁???? ---
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            if st.button("?? ?瑁??葫 (Run)", type="primary"):
+                with st.spinner("甇??澆 predict_tomorrow.py 閮?銝?.."):
+                    try:
+                        # ?澆憭?單
+                        subprocess.run(["python", "predict_tomorrow.py"], check=True)
+                        st.success("閮?摰?嚗?)
+                        import time
+                        time.sleep(1)
+                        st.rerun() # ??渡??
+                    except Exception as e:
+                        st.error(f"?瑁?憭望?: {e}")
+
+        st.divider()
+
+        # --- 憿舐內鞈?? ---
+        if not history_file.exists():
+            st.warning("撠甇瑕蝝??隢????寞??銵?皜研?)
+            return
+
+        try:
+            df_hist = pd.read_csv(history_file)
+            if df_hist.empty:
+                st.info("蝝???箇征??)
+                return
+
+            # ?交???
+            df_hist['date'] = pd.to_datetime(df_hist['date'])
+            df_hist = df_hist.sort_values('date', ascending=False)
+            
+            latest_date = df_hist.iloc[0]['date']
+            latest_date_str = latest_date.strftime('%Y-%m-%d')
+            df_today = df_hist[df_hist['date'] == latest_date]
+
+            # 蝯梯?
+            long_votes = len(df_today[df_today['signal'] == 'LONG'])
+            total_votes = len(df_today)
+            cash_votes = total_votes - long_votes
+            
+            # --- ?銵冽 ---
+            st.subheader(f"?? 鞈??交?嚗latest_date_str}")
+            
+            k1, k2, k3 = st.columns(3)
+            k1.metric("? 憭蟡冽", f"{long_votes} 蟡?, f"{long_votes/total_votes:.0%}" if total_votes else "")
+            k2.metric("??蝛箸?蟡冽", f"{cash_votes} 蟡?)
+            
+            final_decision = "? ?脣?? (LONG)" if long_votes > cash_votes else "??蝛箸?閫??(CASH)"
+            k3.metric("?蝯遣霅?, final_decision)
+
+            # --- 閰喟敦? ---
+            st.markdown("### ?儭?蝑?巨?敦")
+            # 蝪∪蝢?
+            display_df = df_today[['strategy_name', 'signal', 'price']].copy()
+            display_df.columns = ['蝑?迂', '閮?', '?嗥??]
+            st.dataframe(display_df, use_container_width=True)
+
+            # --- 甇瑕頞典 ---
+            st.markdown("### ?? 甇瑕閮?頞典")
+            df_trend = df_hist.groupby('date')['signal'].apply(lambda x: (x=='LONG').sum()).reset_index()
+            df_trend.columns = ['date', 'long_count']
+            st.bar_chart(df_trend.set_index('date'))
+            
+        except Exception as e:
+            st.error(f"霈????隤? {e}")
+            st.write("隢炎??csv 瑼??澆??臬甇?Ⅱ??)
+        
+        return
+    # ?湧?甈?
+    st.sidebar.header("閮剖?")
+    default_tickers = ["00631L.TW", "2330.TW", "AAPL", "VOO"]
+    ticker = st.sidebar.selectbox("?∠巨隞??:", default_tickers, index=0)
+    start_date_input = st.sidebar.text_input("?豢?韏瑕??交? (YYYY-MM-DD):", "2010-01-01")
+    end_date_input = st.sidebar.text_input("?豢?蝯??交? (YYYY-MM-DD):", "")
+    trade_cooldown_bars = st.sidebar.number_input("?瑕??(bars):", min_value=0, max_value=20, value=3, step=1, format="%d")
+    discount = st.sidebar.slider("?詨??(0.7=7?? 0.1=1??", min_value=0.1, max_value=0.70, value=0.30, step=0.01)
+    st.sidebar.markdown("鞎琿脫?蝥祥 = 0.1425% x ?,鞈?? = 0.1425% x ? + 0.3%(鈭斗?蝔?.")
+    bad_holding = st.sidebar.checkbox("鞈??梢??-20%,蝑?銝活鞈??", value=False)
+    
+    # 瘛餃?敹怠?蝞∠??賊?
+    st.sidebar.header("敹怠?蝞∠?")
+    force_update = st.sidebar.checkbox("撘瑕?湔?∪?豢?", value=False)
+    clear_cache_before_run = st.sidebar.checkbox("?瑁????文翰??, value=False)
+    
+    run_backtests = st.sidebar.button("?? 銝?萄銵???皜?)
+
+    # 頛?豢?
+    df_raw, df_factor = load_data(ticker, start_date=start_date_input, 
+                                  end_date=end_date_input if end_date_input else None, 
+                                  smaa_source="Self", force_update=force_update)
+    if df_raw.empty:
+        st.error(f"?⊥?頛 {ticker} ???隢炎?亥蟡其誨蝣潭?蝔??岫.")
+        return
+
+    # ?葫璅惜??
+    show_legacy_main = st.sidebar.checkbox("憿舐內???身", value=False, key="show_legacy_main")
+    strategy_names = get_param_preset_names(include_hidden=show_legacy_main)
+    if not strategy_names:
+        st.error("?桀?瘝??舐??閮剔??乓?)
+        return
+    tabs = st.tabs(strategy_names + ["鞎瑁都暺?頛?])
+    results = {}
+
+    if run_backtests:
+        # ?瑁????文翰??
+        if clear_cache_before_run:
+            clear_all_caches()
+            st.info("撌脫??斗??翰??)
+        
+        with st.spinner("甇?閮????皜?.."):
+            for strategy in strategy_names:
+                params = param_presets[strategy]
+                strategy_type = params["strategy_type"]
+# ???身??smaa_source ?冽????selectbox
+                default_source = params.get("smaa_source", "Self")
+                # 雿輻 selectbox ?潔??箏祕?? smaa_source
+                smaa_source = default_source  # ?冽??皜祆?雿輻?身??
+                # 頛?豢?
+                df_raw, df_factor = load_data(
+                                    ticker,
+                                    start_date=start_date_input,
+                                    end_date=end_date_input if end_date_input else None,
+                                    smaa_source=smaa_source,
+                                    force_update=force_update
+                )
+                
+                if strategy_type == 'ensemble':
+                    active_raw = manager.load_strategies("strategy_warehouse.json") if manager else []
+                    strat_list = _extract_strategy_names(active_raw)
+                    params_ens = params.copy()
+                    params_ens["strategies"] = strat_list
+                    df_ind, result = _build_ensemble_result(
+                        params=params_ens,
+                        ticker=ticker,
+                        df_raw=df_raw,
+                        strategy_names=strat_list,
+                    )
+                elif strategy_type == 'ssma_turn':
+                    calc_keys = [
+                        'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                        'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days', 'quantile_win',
+                        'volume_target_pass_rate', 'volume_target_lookback'
+                    ]
+                    ssma_params = {k: v for k, v in params.items() if k in calc_keys}
+                    backtest_params = ssma_params.copy()
+                    backtest_params['stop_loss'] = params.get('stop_loss', 0.0)
+                    df_ind, buy_dates, sell_dates = compute_ssma_turn_combined(
+                        df_raw, df_factor, **ssma_params, smaa_source=smaa_source
+                    )
+                    if df_ind.empty:
+                        st.warning(f"{strategy} 蝑閮?憭望?,?航?舀??頞?")
+                        continue
+                    result = backtest_unified(
+                        df_ind, strategy_type, backtest_params, buy_dates, sell_dates,
+                        discount=discount, trade_cooldown_bars=trade_cooldown_bars, bad_holding=bad_holding
+                    )
+                else:
+                    if strategy_type == 'single':
+                        df_ind = compute_single(
+                            df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                            params["devwin"], smaa_source=smaa_source
+                        )
+                    elif strategy_type == 'dual':
+                        df_ind = compute_dual(
+                            df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                            params["short_win"], params["long_win"], smaa_source=smaa_source
+                        )
+                    elif strategy_type == 'RMA':
+                        df_ind = compute_RMA(
+                            df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                            params["rma_len"], params["dev_len"], smaa_source=smaa_source
+                        )
+                    if df_ind.empty:
+                        st.warning(f"{strategy} 蝑閮?憭望?,?航?舀??頞?")
+                        continue
+                    result = backtest_unified(
+                        df_ind, strategy_type, params, discount=discount,
+                        trade_cooldown_bars=trade_cooldown_bars, bad_holding=bad_holding
+                    )
+
+                results[strategy] = (df_ind, result['trades'], result['trade_df'],
+                                     result['signals_df'], result['metrics'])
+
+    for tab, strategy in zip(tabs[:-1], strategy_names):
+        with tab:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                # 雿輻 Markdown 憿舐內蝑隤祆?
+                if strategy in ["Single ??, "Single ??, "Single ??]:
+                    tooltip = f"{strategy} ??Single 蝑???貉?擃?撅內銝??銵函."
+                elif strategy == "Dual-Scale":
+                    tooltip = f"{strategy} ??Dual-Scale 蝑,雿輻?剜????SMAA ?脰?鈭斗?."
+                elif strategy in ["SSMA_turn_1", "SSMA_turn_2"]:
+                    tooltip = f"{strategy} ?臬??SMAA 撜航健瑼Ｘ葫??鈭日??蕪蝑,撠釣?潛帘?亦?鞎瑁都??."
+                else:
+                    tooltip = "蝑隤祆?"
+
+                # 雿輻 HTML ??CSS 撖衣瘞?部?內
+                html = f"""
+                <h3>
+                    <span title="{tooltip}" style="cursor: help; font-weight: bold;">
+                        ?葫蝑: {strategy}
+                    </span>
+                </h3>
+                """
+                st.markdown(html, unsafe_allow_html=True)
+
+            with col2:
+                # ???身??smaa_source ?冽????selectbox
+                params = param_presets[strategy]
+                default_source = params.get("smaa_source", "Self")
+                options = ["Self", "Factor (^TWII / 2412.TW)", "Factor (^TWII / 2414.TW)"]
+                # 閮剔蔭 selectbox嚗?憪潛 default_source
+                smaa_source = st.selectbox(
+                    "SMAA ?豢?皞?",
+                    options,
+                    index=options.index(default_source) if default_source in options else 0,
+                    key=f"smaa_source_{strategy}"
+                )
+
+            strategy_type = params["strategy_type"]
+            # 雿輻 selectbox ??smaa_source 頛?豢?
+            df_raw, df_factor = load_data(
+                ticker,
+                start_date=start_date_input,
+                end_date=end_date_input if end_date_input else None,
+                smaa_source=smaa_source,
+                force_update=force_update
+            )
+            # 2025/12/23 11:08 ?芸?瘜典?澈蝑?
+            if strategy_type == 'ensemble':
+                # 1. ????澈?”
+                warehouse_files = []
+                if manager:
+                    warehouse_files = manager.list_warehouses()
+
+                # 2. UI ?豢???
+                selected_warehouse = "strategy_warehouse.json"
+                if warehouse_files:
+                    selected_warehouse = st.selectbox(
+                        "?? ?豢?蝑?澈 (Version)",
+                        warehouse_files,
+                        index=0,
+                        key=f"wh_select_{strategy}"
+                    )
+                else:
+                    st.warning("?⊥?瘝??澈璅?隞?Ensemble ???芣??交????")
+
+                # 3. 霈?摰??澈
+                strat_list = []
+                if manager:
+                    active = manager.load_strategies(selected_warehouse)
+                    strat_list = _extract_strategy_names(active)
+
+                    if selected_warehouse != "strategy_warehouse.json":
+                        st.info(f"?? ?桀?甇?瑼Ｚ??遢摮?: {selected_warehouse}")
+                        if st.button("??撠迨?閮剔?曉蝴 (Activate)", key=f"btn_activate_{strategy}"):
+                            manager.set_active_warehouse(selected_warehouse)
+                            st.success("閮剖?摰?嚗?甈?`predict_tomorrow` 撠蝙?冽迨???)
+                            st.rerun()
+                    else:
+                        st.caption("????桀??敶寧???(Active)")
+
+                params = params.copy()
+                params['strategies'] = strat_list            
+            # 閮??葫蝯?
+            if strategy_type == 'ensemble':
+                df_ind, result = _build_ensemble_result(
+                    params=params,
+                    ticker=ticker,
+                    df_raw=df_raw,
+                    strategy_names=params.get("strategies", []),
+                )
+            elif strategy_type == 'ssma_turn':
+                calc_keys = [
+                    'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                    'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days',
+                    'quantile_win', 'volume_target_pass_rate', 'volume_target_lookback'
+                ]
+                ssma_params = {k: v for k, v in params.items() if k in calc_keys}
+                # 2) 蝣箔? stop_loss ?喲?蝯?backtest_unified
+                backtest_params = ssma_params.copy()
+                backtest_params['stop_loss'] = params.get('stop_loss', 0.0)
+                df_ind, buy_dates, sell_dates = compute_ssma_turn_combined(
+                    df_raw, df_factor, **ssma_params, smaa_source=smaa_source
+                )
+                if df_ind.empty:
+                    st.warning(f"{strategy} 蝑閮?憭望?,?航?舀??頞?")
+                    continue
+                result = backtest_unified(
+                    df_ind, strategy_type, backtest_params, buy_dates, sell_dates,
+                    discount=discount, trade_cooldown_bars=trade_cooldown_bars, bad_holding=bad_holding
+                )
+            else:
+                if strategy_type == 'single':
+                    df_ind = compute_single(
+                        df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                        params["devwin"], smaa_source=smaa_source
+                    )
+                elif strategy_type == 'dual':
+                    df_ind = compute_dual(
+                        df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                        params["short_win"], params["long_win"], smaa_source=smaa_source
+                    )
+                elif strategy_type == 'RMA':
+                    df_ind = compute_RMA(
+                        df_raw, df_factor, params["linlen"], params["factor"], params["smaalen"],
+                        params["rma_len"], params["dev_len"], smaa_source=smaa_source
+                    )
+                if df_ind.empty:
+                    st.warning(f"{strategy} 蝑閮?憭望?,?航?舀??頞?")
+                    continue
+                result = backtest_unified(
+                    df_ind, strategy_type, params, discount=discount,
+                    trade_cooldown_bars=trade_cooldown_bars, bad_holding=bad_holding
+                )
+            
+            results[strategy] = (df_ind, result['trades'], result['trade_df'], 
+                                 result['signals_df'], result['metrics'])
+            
+            # 憿舐內蝑??,?喳 trade_df 隞亥?蝞像???予??
+            display_strategy_summary(strategy, params, result['metrics'], smaa_source, result['trade_df'])
+            
+            # 憿舐內?”?漱??蝝?
+            has_trades = ('trade_df' in result) and (result['trade_df'] is not None) and (not result['trade_df'].empty)
+            if has_trades:
+                st.plotly_chart(plot_stock_price(df_raw, result['trade_df'], ticker), 
+                                use_container_width=True, key=f"stock_price_{strategy}")
+
+                # ???芸?雿輻 daily_state嚗nsemble 甇?Ⅱ頝臬?嚗?瘝????trade_df
+                ds_or_trades = result.get('daily_state', result.get('trade_df'))
+                # 璅???daily_state ?鼓???踹?甈??炊??
+                if ds_or_trades is not None and not ds_or_trades.empty:
+                    ds_or_trades = normalize_daily_state(ds_or_trades)
+                
+                # ?? ?菟頛詨嚗??迤閬????亙???csv
+                try:
+                    print(f"?? ???菟頛詨嚗strategy}")
+                    print(f"   ds_or_trades type: {type(ds_or_trades)}")
+                    if hasattr(ds_or_trades, 'shape'):
+                        print(f"   ds_or_trades shape: {ds_or_trades.shape}")
+                    if hasattr(ds_or_trades, 'columns'):
+                        print(f"   ds_or_trades columns: {list(ds_or_trades.columns)}")
+                    
+                    # 瑼Ｘ?臬??equity/cash 甈?嚗???撠梁 dump_equity_cash嚗? dump_timeseries
+                    if isinstance(ds_or_trades, pd.DataFrame) and {"equity", "cash"}.issubset(ds_or_trades.columns):
+                        print(f"   ???潛 equity/cash 甈?嚗蝙??dump_equity_cash")
+                        dump_equity_cash(f"dash_{strategy}", ds_or_trades)
+                    else:
+                        print(f"   ?? 瘝? equity/cash 甈?嚗蝙??dump_timeseries 頛詨鈭斗??豢?")
+                        # 頛詨鈭斗??豢?雿?
+                        if 'trade_df' in result and result['trade_df'] is not None:
+                            dump_timeseries(f"dash_{strategy}_trades", trades=result['trade_df'])
+                        # 頛詨 daily_state ?豢?嚗???嚗?
+                        if 'daily_state' in result and result['daily_state'] is not None:
+                            dump_timeseries(f"dash_{strategy}_daily_state", daily_state=result['daily_state'])
+                    
+                    # ???????寞銋??綽??踹? index 撠?朣?
+                    if 'weight_curve' in result:
+                        print(f"   weight_curve type: {type(result['weight_curve'])}")
+                        if hasattr(result['weight_curve'], 'shape'):
+                            print(f"   weight_curve shape: {result['weight_curve'].shape}")
+                        dump_timeseries(f"dash_{strategy}_weights", weight=result['weight_curve'], price=df_raw['close'])
+                    else:
+                        print(f"   ?? 瘝? weight_curve ??result 銝?)
+                        print(f"   result keys: {list(result.keys())}")
+                except Exception as e:
+                    print(f"???菟頛詨憭望?嚗e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                st.plotly_chart(plot_equity_cash(ds_or_trades, df_raw), 
+                                use_container_width=True, key=f"equity_cash_{strategy}")
+                st.plotly_chart(plot_indicators(df_ind, strategy_type, result['trade_df'], params), 
+                                use_container_width=True, key=f"indicators_{strategy}")                
+                st.subheader("鈭斗??敦")
+                # ?芸?雿輻 trade_ledger嚗nsemble ???港漱????嚗甈∠ trade_df
+                display_df = None
+                if strategy_type == 'ensemble' and 'trade_ledger' in result and not result['trade_ledger'].empty:
+                    display_df = result['trade_ledger']
+                else:
+                    display_df = result['trade_df']
+                
+                # 璅????撘?憿舐內
+                display_df_std = normalize_trades_for_ui(display_df)
+                display_df_formatted = format_trade_df_for_display(display_df_std)
+                
+                st.dataframe(display_df_formatted)
+                st.markdown("**????格?靽∟??亦??予嚗+1嚗??祈” signal_date=trade_date 隞?”靽∟??亙銝??*")
+            else:
+                st.warning(f"{strategy} 蝑?芰?遙雿漱???航?臬??貉身蝵格??豢???.")
+
+    # 鞎瑁都暺?頛?蝐日?
+    with tabs[-1]:
+        st.subheader("????亥眺鞈??瘥?")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_raw.index, y=df_raw['close'], name='Close Price', line=dict(color='dodgerblue')))
+        colors = ['green', 'limegreen', 'red', 'orange', 'purple', 'blue', 'pink', 'cyan']
+        for i, strategy in enumerate(strategy_names):
+            if strategy in results and not results[strategy][2].empty:
+                trade_df = results[strategy][2]
+                buys = trade_df[trade_df['type'] == 'buy']
+                sells = trade_df[trade_df['type'] == 'sell']
+                fig.add_trace(go.Scatter(x=buys['trade_date'], y=buys['price'], mode='markers', name=f'{strategy} Buy',
+                                         marker=dict(symbol='cross', size=8, color=colors[i % len(colors)])))
+                fig.add_trace(go.Scatter(x=sells['trade_date'], y=sells['price'], mode='markers', name=f'{strategy} Sell',
+                                         marker=dict(symbol='x', size=8, color=colors[i % len(colors)])))
+        fig.update_layout(title=f'{ticker} ????亥眺鞈??瘥?',
+                          xaxis_title='Date', yaxis_title='?∪', template='plotly_white')
+        fig.update_layout(
+            legend=dict(
+                x=1.05,
+                y=1,
+                xanchor='left',
+                yanchor='top',
+                bordercolor="Black",
+                borderwidth=1,
+                bgcolor="white",
+                itemsizing='constant',
+                orientation='v'
+            )
+        )
+        st.plotly_chart(fig, use_container_width=True, key="buy_sell_comparison")
+        
+        st.subheader("蝮暹?瘥?銵?)
+        comparison_data = []
+        for strategy in strategy_names:
+            if strategy in results and results[strategy][4]:
+                metrics = results[strategy][4]
+                comparison_data.append({
+                    '蝑': strategy,
+                    '蝮賢??梁?': f"{metrics.get('total_return', 0):.2%}",
+                    '撟游????: f"{metrics.get('annual_return', 0):.2%}",
+                    '?憭批???: f"{metrics.get('max_drawdown', 0):.2%}",
+                    '?∠瘥?': f"{metrics.get('calmar_ratio', 0):.2f}",
+                    '鈭斗?甈⊥': metrics.get('num_trades', 0),
+                    '??': f"{metrics.get('win_rate', 0):.2%}",
+                    '?瘥?: f"{metrics.get('payoff_ratio', 0):.2f}"
+                })
+        if comparison_data:
+            st.dataframe(pd.DataFrame(comparison_data))
+        else:
+            st.warning("?∪瘥???皜祉???隢??瑁??葫.")
+
+# ?啣???蝯????賣
+def calculate_portfolio_weights_and_performance(equity_curves, weight_method, rebalance_freq, lookback_period):
+    """閮???蝯?甈??蜀??""
+    if not equity_curves:
+        return {}
+    
+    # ?曉?勗???????
+    all_dates = set()
+    for equity_curve in equity_curves.values():
+        all_dates.update(equity_curve.index)
+    
+    common_dates = sorted(list(all_dates))
+    if len(common_dates) < 2:
+        return {}
+    
+    # ????鞈???
+    portfolio_equity = pd.Series(index=common_dates, dtype=float)
+    portfolio_equity.iloc[0] = 1.0
+    
+    # 甈?甇瑕閮?
+    weight_history = {strategy: [] for strategy in equity_curves.keys()}
+    date_history = []
+    
+    # ??甈?
+    n_strategies = len(equity_curves)
+    current_weights = {strategy: 1.0 / n_strategies for strategy in equity_curves.keys()}
+    
+    # ?撟唾﹛?餌?頧?
+    if rebalance_freq == "摮?漲":
+        rebalance_months = 3
+    elif rebalance_freq == "撟游漲":
+        rebalance_months = 12
+    else:
+        rebalance_months = None
+    
+    # 閮??撟唾﹛?交?
+    rebalance_dates = []
+    if rebalance_months:
+        current_date = pd.to_datetime(common_dates[0])
+        end_date = pd.to_datetime(common_dates[-1])
+        
+        while current_date <= end_date:
+            rebalance_dates.append(current_date)
+            # 閮?銝????啣像銵⊥??
+            if current_date.month + rebalance_months > 12:
+                year = current_date.year + 1
+                month = (current_date.month + rebalance_months) % 12
+                if month == 0:
+                    month = 12
+            else:
+                year = current_date.year
+                month = current_date.month + rebalance_months
+            
+            current_date = current_date.replace(year=year, month=month)
+    
+    # ?瑁???蝯?閮?
+    for i, date in enumerate(common_dates):
+        if i == 0:
+            continue
+        
+        # 瑼Ｘ?臬?閬??啣像銵?
+        if rebalance_months and pd.to_datetime(date) in rebalance_dates:
+            # 閮??啁?甈?
+            performance_metrics = {}
+            for strategy_name, equity_curve in equity_curves.items():
+                if date in equity_curve.index:
+                    # 閮?????”??
+                    lookback_start = max(0, i - lookback_period)
+                    if lookback_start < len(equity_curve):
+                        past_equity = equity_curve.iloc[lookback_start:i+1]
+                        if len(past_equity) > 1:
+                            if weight_method == "蝑???:
+                                performance_metrics[strategy_name] = 1.0
+                            elif weight_method == "憭瘥?甈?":
+                                returns = past_equity.pct_change().dropna()
+                                if len(returns) > 0 and returns.std() > 0:
+                                    sharpe = returns.mean() / returns.std() * np.sqrt(252)
+                                    performance_metrics[strategy_name] = max(sharpe, 0)
+                                else:
+                                    performance_metrics[strategy_name] = 0
+                            elif weight_method == "?孵榆?甈?":
+                                returns = past_equity.pct_change().dropna()
+                                if len(returns) > 0 and returns.std() > 0:
+                                    performance_metrics[strategy_name] = 1.0 / (returns.std() ** 2)
+                                else:
+                                    performance_metrics[strategy_name] = 0
+                            elif weight_method == "??隤踵":
+                                performance = (past_equity.iloc[-1] / past_equity.iloc[0]) - 1
+                                performance_metrics[strategy_name] = max(performance, 0)
+                            else:
+                                performance_metrics[strategy_name] = 1.0
+                        else:
+                            performance_metrics[strategy_name] = 0
+                    else:
+                        performance_metrics[strategy_name] = 0
+                else:
+                    performance_metrics[strategy_name] = 0
+            
+            # ?閮?甈?
+            total_performance = sum(performance_metrics.values())
+            if total_performance > 0:
+                current_weights = {name: perf / total_performance for name, perf in performance_metrics.items()}
+            else:
+                # 憒?瘝?甇???雿輻蝑???
+                current_weights = {name: 1.0 / n_strategies for name in equity_curves.keys()}
+        
+        # 閮?甈?
+        date_history.append(date)
+        for strategy in equity_curves.keys():
+            weight_history[strategy].append(current_weights.get(strategy, 0))
+        
+        # 閮??嗆蝯??孵?
+        daily_return = 0
+        for strategy_name, equity_curve in equity_curves.items():
+            if date in equity_curve.index and i > 0:
+                if i > 0 and common_dates[i-1] in equity_curve.index:
+                    strategy_return = (equity_curve.loc[date] / equity_curve.loc[common_dates[i-1]]) - 1
+                    daily_return += strategy_return * current_weights[strategy_name]
+        
+        # ?湔蝯?甈?
+        portfolio_equity.loc[date] = portfolio_equity.loc[common_dates[i-1]] * (1 + daily_return)
+    
+    # 閮???蝯???
+    total_return = (portfolio_equity.iloc[-1] / portfolio_equity.iloc[0]) - 1
+    years = (pd.to_datetime(common_dates[-1]) - pd.to_datetime(common_dates[0])).days / 365.25
+    annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+    
+    # 閮??憭批???
+    cumulative_max = portfolio_equity.expanding().max()
+    drawdown = (portfolio_equity - cumulative_max) / cumulative_max
+    max_drawdown = drawdown.min()
+    
+    # 閮?憭瘥?
+    daily_returns = portfolio_equity.pct_change().dropna()
+    sharpe_ratio = daily_returns.mean() / daily_returns.std() * np.sqrt(252) if daily_returns.std() > 0 else 0
+    
+    return {
+        'portfolio_equity': portfolio_equity,
+        'weight_history': weight_history,
+        'date_history': date_history,
+        'total_return': total_return,
+        'annual_return': annual_return,
+        'max_drawdown': max_drawdown,
+        'sharpe_ratio': sharpe_ratio,
+        'rebalance_freq': rebalance_freq,
+        'weight_method': weight_method,
+        'individual_equity_curves': equity_curves
+    }
+
+def display_portfolio_analysis(portfolio_analysis, selected_strategies, weight_method, rebalance_freq):
+    """憿舐內??蝯???蝯?"""
+    if not portfolio_analysis:
+        st.error("?⊥?閮???蝯???")
+        return
+    
+    # ?萄遣璅惜??
+    tabs = st.tabs(["?? 甈??脩?", "?? 甈?甇瑕", "?? 蝮暹???", "?? 甈?瑼Ｘ"])
+    
+    # 甈??脩?璅惜??
+    with tabs[0]:
+        st.subheader("??蝯??蝑甈??脩?")
+        
+        fig = go.Figure()
+        
+        # 瘛餃???蝯?甈??脩?
+        portfolio_equity = portfolio_analysis['portfolio_equity']
+        fig.add_trace(go.Scatter(
+            x=portfolio_equity.index,
+            y=portfolio_equity.values,
+            name='??蝯?',
+            line=dict(color='red', width=3),
+            mode='lines'
+        ))
+        
+        # 瘛餃??蝑甈??脩?
+        colors = ['blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive']
+        for i, strategy in enumerate(selected_strategies):
+            if strategy in portfolio_analysis['individual_equity_curves']:
+                equity_curve = portfolio_analysis['individual_equity_curves'][strategy]
+                fig.add_trace(go.Scatter(
+                    x=equity_curve.index,
+                    y=equity_curve.values,
+                    name=strategy,
+                    line=dict(color=colors[i % len(colors)], width=1),
+                    mode='lines'
+                ))
+        
+        fig.update_layout(
+            title=f"??蝯?甈??脩? ({weight_method}, {rebalance_freq})",
+            xaxis_title="?交?",
+            yaxis_title="甈?",
+            template="plotly_white",
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # 甈?甇瑕璅惜??
+    with tabs[1]:
+        st.subheader("蝑甈?甇瑕霈?")
+        
+        # ?萄遣甈?甇瑕?”
+        fig = go.Figure()
+        
+        weight_history = portfolio_analysis['weight_history']
+        date_history = portfolio_analysis['date_history']
+        
+        colors = ['blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive']
+        for i, strategy in enumerate(selected_strategies):
+            if strategy in weight_history:
+                weights = weight_history[strategy]
+                fig.add_trace(go.Scatter(
+                    x=date_history,
+                    y=weights,
+                    name=strategy,
+                    line=dict(color=colors[i % len(colors)]),
+                    mode='lines',
+                    stackgroup='one'
+                ))
+        
+        fig.update_layout(
+            title=f"蝑甈?甇瑕 ({weight_method}, {rebalance_freq})",
+            xaxis_title="?交?",
+            yaxis_title="甈?",
+            template="plotly_white",
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 憿舐內甈?蝯梯?
+        st.subheader("甈?蝯梯?")
+        weight_stats = []
+        for strategy in selected_strategies:
+            if strategy in weight_history:
+                weights = weight_history[strategy]
+                weight_stats.append({
+                    '蝑': strategy,
+                    '撟喳?甈?': f"{np.mean(weights):.3f}",
+                    '?憭扳???: f"{np.max(weights):.3f}",
+                    '?撠???: f"{np.min(weights):.3f}",
+                    '甈?璅?撌?: f"{np.std(weights):.3f}"
+                })
+        
+        if weight_stats:
+            st.dataframe(pd.DataFrame(weight_stats))
+    
+    # 蝮暹???璅惜??
+    with tabs[2]:
+        st.subheader("??蝯?蝮暹???")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("蝮賢??梁?", f"{portfolio_analysis['total_return']:.2%}")
+        
+        with col2:
+            st.metric("撟游????, f"{portfolio_analysis['annual_return']:.2%}")
+        
+        with col3:
+            st.metric("?憭批???, f"{portfolio_analysis['max_drawdown']:.2%}")
+        
+        with col4:
+            st.metric("憭瘥?", f"{portfolio_analysis['sharpe_ratio']:.3f}")
+        
+        # 憿舐內閰喟敦??
+        st.subheader("閰喟敦蝮暹???")
+        
+        # 閮?憿???
+        portfolio_equity = portfolio_analysis['portfolio_equity']
+        daily_returns = portfolio_equity.pct_change().dropna()
+        
+        # 閮?銝?憸券
+        downside_returns = daily_returns[daily_returns < 0]
+        downside_risk = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
+        
+        # 閮?蝝Ｘ?隢暹???
+        sortino_ratio = portfolio_analysis['annual_return'] / downside_risk if downside_risk > 0 else 0
+        
+        # 閮??∠瘥?
+        calmar_ratio = portfolio_analysis['annual_return'] / abs(portfolio_analysis['max_drawdown']) if portfolio_analysis['max_drawdown'] < 0 else 0
+        
+        # 閮?甇??祆?隞賣?靘?
+        monthly_returns = portfolio_equity.resample('M').last().pct_change().dropna()
+        positive_months = (monthly_returns > 0).sum() / len(monthly_returns) if len(monthly_returns) > 0 else 0
+        
+        detailed_metrics = {
+            '??': ['蝮賢??梁?', '撟游????, '撟游?瘜Ｗ???, '?憭批???, '憭瘥?', '蝝Ｘ?隢暹???, '?∠瘥?', '甇??祆?隞賣?靘?],
+            '?詨?: [
+                f"{portfolio_analysis['total_return']:.2%}",
+                f"{portfolio_analysis['annual_return']:.2%}",
+                f"{daily_returns.std() * np.sqrt(252):.2%}",
+                f"{portfolio_analysis['max_drawdown']:.2%}",
+                f"{portfolio_analysis['sharpe_ratio']:.3f}",
+                f"{sortino_ratio:.3f}",
+                f"{calmar_ratio:.3f}",
+                f"{positive_months:.2%}"
+            ]
+        }
+        
+        st.dataframe(pd.DataFrame(detailed_metrics))
+    
+    # 甈?瑼Ｘ璅惜??
+    with tabs[3]:
+        st.subheader("甈?瑼Ｘ撌亙")
+        
+        # ?交??豢???
+        if portfolio_analysis['date_history']:
+            selected_date = st.selectbox(
+                "?豢?瑼Ｘ?交?:",
+                portfolio_analysis['date_history'],
+                index=len(portfolio_analysis['date_history']) - 1
+            )
+            
+            # 憿舐內?詨??交?????
+            st.subheader(f"?交?: {selected_date} ??????)
+            
+            date_index = portfolio_analysis['date_history'].index(selected_date)
+            current_weights = {}
+            
+            for strategy in selected_strategies:
+                if strategy in portfolio_analysis['weight_history']:
+                    weight = portfolio_analysis['weight_history'][strategy][date_index]
+                    current_weights[strategy] = weight
+            
+            # ?萄遣甈?????
+            fig = go.Figure(data=[go.Pie(
+                labels=list(current_weights.keys()),
+                values=list(current_weights.values()),
+                hole=0.3
+            )])
+            
+            fig.update_layout(
+                title=f"甈??? ({selected_date})",
+                height=400
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 憿舐內甈?銵冽
+            weight_df = pd.DataFrame([
+                {'蝑': strategy, '甈?': f"{weight:.3f}"}
+                for strategy, weight in current_weights.items()
+            ])
+            
+            st.dataframe(weight_df)
+            
+            # 憿舐內甈?霈?頞典
+            st.subheader("甈?霈?頞典")
+            
+            # ?豢?閬＊蝷箇?蝑
+            selected_strategies_for_trend = st.multiselect(
+                "?豢?閬＊蝷箇?蝑:",
+                selected_strategies,
+                default=selected_strategies[:3]
+            )
+            
+            if selected_strategies_for_trend:
+                fig = go.Figure()
+                
+                colors = ['blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive']
+                for i, strategy in enumerate(selected_strategies_for_trend):
+                    if strategy in portfolio_analysis['weight_history']:
+                        weights = portfolio_analysis['weight_history'][strategy]
+                        fig.add_trace(go.Scatter(
+                            x=portfolio_analysis['date_history'],
+                            y=weights,
+                            name=strategy,
+                            line=dict(color=colors[i % len(colors)])
+                        ))
+                
+                fig.update_layout(
+                    title="?詨?蝑甈?霈?頞典",
+                    xaxis_title="?交?",
+                    yaxis_title="甈?",
+                    template="plotly_white",
+                    height=400
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__":
+    run_app()                    
+

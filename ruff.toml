@@ -1,0 +1,38 @@
+line-length = 120
+target-version = "py312"
+respect-gitignore = true
+
+include = [
+  "app_dash.py",
+  "SSSv096.py",
+  "SSS_EnsembleTab.py",
+  "run_full_pipeline_5.py",
+  "run_oos_analysis.py",
+  "run_enhanced_ensemble.py",
+  "run_batch_smart_leverage.py",
+  "convert_results_to_trades.py",
+  "init_warehouse.py",
+  "sss_core/**/*.py",
+  "runners/**/*.py",
+  "analysis/optuna_16.py",
+  "analysis/optimize_ensemble.py",
+  "analysis/strategy_manager.py",
+  "analysis/data_loader.py",
+  "analysis/config.py",
+  "analysis/metrics.py",
+  "analysis/logging_config.py",
+  "tests/**/*.py",
+]
+
+exclude = [
+  ".git", ".hg", ".svn",
+  "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+  ".venv", "venv", "env",
+  "build", "dist",
+  "node_modules",
+  "data", "datasets", "logs", "notebooks", "reports",
+  "archive", ".history", "legacy", "cache",
+]
+
+[lint]
+select = ["E722", "F821"]

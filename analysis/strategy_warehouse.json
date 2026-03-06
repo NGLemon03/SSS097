@@ -1,0 +1,116 @@
+{
+    "last_updated": "2026-01-05 11:11:36",
+    "tag": "OOS_Safe_End20250330_Run0105_0818",
+    "metadata": {
+        "split_date": "2025-03-30",
+        "mode": "OOS",
+        "score_mode": "smart_bh"
+    },
+    "strategies": [
+        {
+            "name": "trades_ssma_turn_Factor(TWII_2414.TW)_OOS_Safe_End20250330_Run0105_0818_trial1970",
+            "type": "ssma_turn",
+            "params": {
+                "linlen": 20,
+                "factor": 50,
+                "smaalen": 180,
+                "prom_factor": 19,
+                "min_dist": 18,
+                "buy_shift": 0,
+                "exit_shift": 0,
+                "vol_window": 25,
+                "quantile_win": 190,
+                "signal_cooldown_days": 11,
+                "stop_loss": 0.0
+            }
+        },
+        {
+            "name": "trades_RMA_Factor(TWII_2412.TW)_OOS_Safe_End20250330_Run0105_0818_trial227",
+            "type": "RMA",
+            "params": {
+                "linlen": 145,
+                "smaalen": 110,
+                "rma_len": 70,
+                "dev_len": 80,
+                "factor": 10,
+                "buy_mult": 1.9000000000000001,
+                "sell_mult": 0.7,
+                "stop_loss": 0.15000000000000002
+            }
+        },
+        {
+            "name": "trades_single_Factor(TWII_2412.TW)_OOS_Safe_End20250330_Run0105_0818_trial917",
+            "type": "single",
+            "params": {
+                "linlen": 80,
+                "factor": 10,
+                "smaalen": 30,
+                "devwin": 100,
+                "buy_mult": 1.6,
+                "sell_mult": 1.3,
+                "stop_loss": 0.25
+            }
+        },
+        {
+            "name": "trades_ssma_turn_Factor(TWII_2414.TW)_OOS_Safe_End20250330_Run0105_0818_trial167",
+            "type": "ssma_turn",
+            "params": {
+                "linlen": 20,
+                "factor": 20,
+                "smaalen": 180,
+                "prom_factor": 17,
+                "min_dist": 18,
+                "buy_shift": 0,
+                "exit_shift": 1,
+                "vol_window": 25,
+                "quantile_win": 170,
+                "signal_cooldown_days": 5,
+                "stop_loss": 0.0
+            }
+        },
+        {
+            "name": "trades_RMA_Factor(TWII_2412.TW)_OOS_Safe_End20250330_Run0105_0818_trial1667",
+            "type": "RMA",
+            "params": {
+                "linlen": 150,
+                "smaalen": 105,
+                "rma_len": 80,
+                "dev_len": 75,
+                "factor": 45,
+                "buy_mult": 1.8,
+                "sell_mult": 1.0,
+                "stop_loss": 0.1
+            }
+        },
+        {
+            "name": "trades_single_Factor(TWII_2412.TW)_OOS_Safe_End20250330_Run0105_0818_trial918",
+            "type": "single",
+            "params": {
+                "linlen": 80,
+                "factor": 10,
+                "smaalen": 30,
+                "devwin": 100,
+                "buy_mult": 1.6,
+                "sell_mult": 1.3,
+                "stop_loss": 0.05
+            }
+        },
+        {
+            "name": "trades_ssma_turn_Factor(TWII_2414.TW)_OOS_Safe_End20250330_Run0105_0818_trial1507",
+            "type": "ssma_turn",
+            "params": {
+                "linlen": 20,
+                "factor": 50,
+                "smaalen": 180,
+                "prom_factor": 19,
+                "min_dist": 18,
+                "buy_shift": 0,
+                "exit_shift": 1,
+                "vol_window": 25,
+                "quantile_win": 190,
+                "signal_cooldown_days": 10,
+                "stop_loss": 0.0
+            }
+        }
+    ]
+}

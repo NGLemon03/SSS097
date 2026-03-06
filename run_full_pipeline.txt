@@ -1,0 +1,292 @@
+
+============================================================
+🔄 [Step] 轉換參數為交易檔 (Top 20)
+   Cmd: python convert_results_to_trades.py --top_k 20
+============================================================
+
+🚀 開始轉換 Optuna 結果為交易檔 (Top 20)...
+------------------------------------------------------------
+處理 #1: ssma_turn Trial 13 (Score: 16.97)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:15 INFO [SSS.Logic] 計算 ssma_turn: linlen=20, smaalen=165
+2025-12-23 02:02:16 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 6157.55%, 交易次數=18
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial13.csv (報酬: 6157.5%, 筆數: 18)
+處理 #2: ssma_turn Trial 12 (Score: 15.17)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:16 INFO [SSS.Logic] 計算 ssma_turn: linlen=20, smaalen=165
+2025-12-23 02:02:17 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 5013.00%, 交易次數=18
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial12.csv (報酬: 5013.0%, 筆數: 18)
+處理 #3: ssma_turn Trial 2 (Score: 15.02)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:17 INFO [SSS.Logic] 計算 ssma_turn: linlen=20, smaalen=165
+2025-12-23 02:02:18 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 4627.21%, 交易次數=18
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial2.csv (報酬: 4627.2%, 筆數: 18)
+處理 #4: ssma_turn Trial 204 (Score: 14.73)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:18 INFO [SSS.Logic] 計算 ssma_turn: linlen=50, smaalen=80
+2025-12-23 02:02:19 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 565.19%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_trial204.csv (報酬: 565.2%, 筆數: 12)
+處理 #5: ssma_turn Trial 551 (Score: 14.70)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:19 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:20 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2453.30%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial551.csv (報酬: 2453.3%, 筆數: 12)
+處理 #6: ssma_turn Trial 590 (Score: 14.70)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:20 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:21 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2453.30%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial590.csv (報酬: 2453.3%, 筆數: 12)
+處理 #7: ssma_turn Trial 614 (Score: 14.70)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:21 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:22 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2453.30%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial614.csv (報酬: 2453.3%, 筆數: 12)
+處理 #8: ssma_turn Trial 28 (Score: 14.68)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:22 INFO [SSS.Logic] 計算 ssma_turn: linlen=170, smaalen=155
+2025-12-23 02:02:22 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2708.53%, 交易次數=10
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial28.csv (報酬: 2708.5%, 筆數: 10)
+處理 #9: ssma_turn Trial 382 (Score: 14.62)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:22 INFO [SSS.Logic] 計算 ssma_turn: linlen=170, smaalen=155
+2025-12-23 02:02:23 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2606.53%, 交易次數=11
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial382.csv (報酬: 2606.5%, 筆數: 11)
+處理 #10: ssma_turn Trial 514 (Score: 14.62)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:23 INFO [SSS.Logic] 計算 ssma_turn: linlen=170, smaalen=155
+2025-12-23 02:02:24 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2606.53%, 交易次數=11
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial514.csv (報酬: 2606.5%, 筆數: 11)
+處理 #11: ssma_turn Trial 674 (Score: 14.62)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:24 INFO [SSS.Logic] 計算 ssma_turn: linlen=170, smaalen=155
+2025-12-23 02:02:25 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2606.53%, 交易次數=11
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial674.csv (報酬: 2606.5%, 筆數: 11)
+處理 #12: ssma_turn Trial 794 (Score: 14.62)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:25 INFO [SSS.Logic] 計算 ssma_turn: linlen=170, smaalen=155
+2025-12-23 02:02:26 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2606.53%, 交易次數=11
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial794.csv (報酬: 2606.5%, 筆數: 11)
+處理 #13: ssma_turn Trial 12 (Score: 14.61)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:26 INFO [SSS.Logic] 計算 ssma_turn: linlen=20, smaalen=165
+2025-12-23 02:02:27 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 5860.83%, 交易次數=19
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial12.csv (報酬: 5860.8%, 筆數: 19)
+處理 #14: ssma_turn Trial 665 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:27 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:28 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial665.csv (報酬: 2578.0%, 筆數: 12)
+處理 #15: ssma_turn Trial 692 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:28 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:29 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial692.csv (報酬: 2578.0%, 筆數: 12)
+處理 #16: ssma_turn Trial 695 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:29 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial695.csv (報酬: 2578.0%, 筆數: 12)
+處理 #17: ssma_turn Trial 699 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:29 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:30 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial699.csv (報酬: 2578.0%, 筆數: 12)
+處理 #18: ssma_turn Trial 732 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:30 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:31 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial732.csv (報酬: 2578.0%, 筆數: 12)
+處理 #19: ssma_turn Trial 777 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:31 INFO [SSS.Logic] 計算 ssma_turn: linlen=165, smaalen=155
+2025-12-23 02:02:31 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial777.csv (報酬: 2578.0%, 筆數: 12)
+處理 #20: ssma_turn Trial 838 (Score: 14.59)
+   ↳ 載入數據: Factor (^TWII / 2414.TW) ...
+2025-12-23 02:02:32 INFO [SSS.Logic] ssma_turn 回測結果: 總報酬率 = 2577.95%, 交易次數=12
+   ✅ 成功產生: trades_from_results_ssma_turn_Factor_TWII_2414_trial838.csv (報酬: 2578.0%, 筆數: 12)
+處理 #21: RMA Trial 846 (Score: 8.62)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:32 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2367.04%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial846.csv (報酬: 2367.0%, 筆數: 13)
+處理 #22: RMA Trial 509 (Score: 8.58)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:32 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2356.08%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial509.csv (報酬: 2356.1%, 筆數: 13)
+處理 #23: RMA Trial 925 (Score: 8.58)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:33 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2356.08%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial925.csv (報酬: 2356.1%, 筆數: 13)
+處理 #24: RMA Trial 520 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:33 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial520.csv (報酬: 2309.1%, 筆數: 13)
+處理 #25: RMA Trial 521 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:34 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial521.csv (報酬: 2309.1%, 筆數: 13)
+處理 #26: RMA Trial 522 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:34 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial522.csv (報酬: 2309.1%, 筆數: 13)
+處理 #27: RMA Trial 524 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:35 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial524.csv (報酬: 2309.1%, 筆數: 13)
+處理 #28: RMA Trial 525 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:35 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial525.csv (報酬: 2309.1%, 筆數: 13)
+處理 #29: RMA Trial 527 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:35 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial527.csv (報酬: 2309.1%, 筆數: 13)
+處理 #30: RMA Trial 529 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:36 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial529.csv (報酬: 2309.1%, 筆數: 13)
+處理 #31: RMA Trial 532 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:36 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial532.csv (報酬: 2309.1%, 筆數: 13)
+處理 #32: RMA Trial 549 (Score: 8.54)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:36 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2309.07%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial549.csv (報酬: 2309.1%, 筆數: 13)
+處理 #33: RMA Trial 614 (Score: 8.49)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:37 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2305.84%, 交易次數=19
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial614.csv (報酬: 2305.8%, 筆數: 19)
+處理 #34: RMA Trial 494 (Score: 8.49)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:37 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2304.92%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial494.csv (報酬: 2304.9%, 筆數: 13)
+處理 #35: RMA Trial 373 (Score: 8.42)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:37 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2099.89%, 交易次數=16
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial373.csv (報酬: 2099.9%, 筆數: 16)
+處理 #36: RMA Trial 931 (Score: 8.41)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:38 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2232.15%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial931.csv (報酬: 2232.1%, 筆數: 13)
+處理 #37: RMA Trial 940 (Score: 8.41)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:38 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2232.15%, 交易次數=13
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial940.csv (報酬: 2232.1%, 筆數: 13)
+處理 #38: RMA Trial 489 (Score: 8.41)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:38 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2219.33%, 交易次數=16
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial489.csv (報酬: 2219.3%, 筆數: 16)
+處理 #39: RMA Trial 863 (Score: 8.38)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:39 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2128.61%, 交易次數=23
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial863.csv (報酬: 2128.6%, 筆數: 23)
+處理 #40: RMA Trial 326 (Score: 8.36)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:39 INFO [SSS.Logic] RMA 回測結果: 總報酬率 = 2174.86%, 交易次數=23
+   ✅ 成功產生: trades_from_results_RMA_Factor_TWII_2412_trial326.csv (報酬: 2174.9%, 筆數: 23)
+處理 #41: single Trial 357 (Score: 6.90)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:39 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2460.12%, 交易次數=34
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial357.csv (報酬: 2460.1%, 筆數: 34)
+處理 #42: single Trial 696 (Score: 6.90)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:40 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2460.12%, 交易次數=34
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial696.csv (報酬: 2460.1%, 筆數: 34)
+處理 #43: single Trial 952 (Score: 6.90)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:40 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2460.12%, 交易次數=34
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial952.csv (報酬: 2460.1%, 筆數: 34)
+處理 #44: single Trial 207 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:40 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial207.csv (報酬: 2491.8%, 筆數: 47)
+處理 #45: single Trial 398 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:41 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial398.csv (報酬: 2491.8%, 筆數: 47)
+處理 #46: single Trial 538 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:41 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial538.csv (報酬: 2491.8%, 筆數: 47)
+處理 #47: single Trial 540 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:41 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial540.csv (報酬: 2491.8%, 筆數: 47)
+處理 #48: single Trial 544 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:42 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial544.csv (報酬: 2491.8%, 筆數: 47)
+處理 #49: single Trial 557 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:42 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial557.csv (報酬: 2491.8%, 筆數: 47)
+處理 #50: single Trial 560 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:43 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial560.csv (報酬: 2491.8%, 筆數: 47)
+處理 #51: single Trial 582 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:43 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial582.csv (報酬: 2491.8%, 筆數: 47)
+處理 #52: single Trial 652 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:43 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial652.csv (報酬: 2491.8%, 筆數: 47)
+處理 #53: single Trial 709 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:44 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial709.csv (報酬: 2491.8%, 筆數: 47)
+處理 #54: single Trial 829 (Score: 6.53)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:44 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2491.83%, 交易次數=47
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial829.csv (報酬: 2491.8%, 筆數: 47)
+處理 #55: single Trial 404 (Score: 6.43)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:44 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2217.90%, 交易次數=67
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial404.csv (報酬: 2217.9%, 筆數: 67)
+處理 #56: single Trial 407 (Score: 6.43)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:45 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2217.90%, 交易次數=67
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial407.csv (報酬: 2217.9%, 筆數: 67)
+處理 #57: single Trial 753 (Score: 6.43)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:45 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2217.90%, 交易次數=67
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial753.csv (報酬: 2217.9%, 筆數: 67)
+處理 #58: single Trial 784 (Score: 6.43)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:46 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2217.90%, 交易次數=67
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial784.csv (報酬: 2217.9%, 筆數: 67)
+處理 #59: single Trial 500 (Score: 6.41)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:46 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2343.14%, 交易次數=60
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial500.csv (報酬: 2343.1%, 筆數: 60)
+處理 #60: single Trial 983 (Score: 6.37)
+   ↳ 載入數據: Factor (^TWII / 2412.TW) ...
+2025-12-23 02:02:46 INFO [SSS.Logic] single 回測結果: 總報酬率 = 2312.40%, 交易次數=53
+   ✅ 成功產生: trades_from_results_single_Factor_TWII_2412_trial983.csv (報酬: 2312.4%, 筆數: 53)
+------------------------------------------------------------
+🎉 轉換完成！共產生 60 個交易檔於 sss_backtest_outputs
+
+============================================================
+🔄 [Step] Ensemble 組合優化實驗
+   Cmd: python analysis/optimize_ensemble.py
+============================================================
+
+🧪 SSS096 Ensemble 優化實驗室 (v2)
+======================================================================
+📥 載入 00631L.TW 作為基準...
+2025-12-23 02:02:51,642 - INFO - 📂 掃描 4821 個 Optuna 結果檔...
+----------------------------------------------------------------------
+設定         | 績效表現 (vs B&H)                       | 風險指標
+----------------------------------------------------------------------
+📊 Top 3      | 報酬: 3504.39% (大盤: 1633.00%) ✅ | MDD: -26.12% | Sharpe: 1.69
+📊 Top 5      | 報酬: 4152.65% (大盤: 1633.00%) ✅ | MDD: -20.19% | Sharpe: 1.81
+📊 Top 7      | 報酬: 2576.87% (大盤: 1633.00%) ✅ | MDD: -20.49% | Sharpe: 1.65
+📊 Top 10     | 報酬: 2391.91% (大盤: 1633.00%) ✅ | MDD: -19.47% | Sharpe: 1.64
+----------------------------------------------------------------------
+🏆 最佳建議: Top 5
+======================================================================
+
+🎉 全流程結束！耗時: 1:39:26.883650
+👉 請根據實驗室建議，執行 `python init_warehouse.py --top_k X` 來鎖定策略。
+PS C:\Stock_reserach\002g> 

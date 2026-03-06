@@ -1,0 +1,91 @@
+# Ensemble 工作流程配置文件
+# 用於統一管理 convert_results_to_trades.py 和 run_enhanced_ensemble.py 的常用參數
+
+# 默認設置
+defaults:
+  ticker: "00631L.TW"
+  top_k: 5
+  results_dir: "results"
+  output_dir: "sss_backtest_outputs"
+  trades_dir: "sss_backtest_outputs"
+
+# 交易成本設置（與 SSS 保持一致）
+cost_settings:
+  base_fee_rate: 0.001425  # 基礎手續費 = 0.1425%
+  tax_rate: 0.003          # 賣出交易税率 = 0.3%
+  default_discount: 0.30   # 默認折扣 = 0.3
+  
+  # 計算後的實際費率 (bp)
+  buy_fee_bp: 4.27        # 買進費率 = 0.0427%
+  sell_fee_bp: 4.27       # 賣出費率 = 0.0427%
+  sell_tax_bp: 30.0       # 税率 = 0.3%
+
+# Ensemble 參數設置
+ensemble_params:
+  # Majority 方法默認參數
+  majority:
+    floor: 0.2
+    ema_span: 3
+    delta_cap: 0.10
+    min_cooldown_days: 5
+    min_trade_dw: 0.02
+    majority_k: "auto"  # 自動計算為 ceil(0.55 * N)
+  
+  # Proportional 方法默認參數
+  proportional:
+    floor: 0.2
+    ema_span: 3
+    delta_cap: 0.30
+    min_cooldown_days: 1
+    min_trade_dw: 0.02
+
+# 參數掃描網格
+scan_grids:
+  min_cooldown_days: [1, 3, 5]
+  delta_cap: [0.10, 0.20, 0.30]
+  min_trade_dw: [0.01, 0.02, 0.03]
+  
+  # majority_k 掃描範圍（根據策略數量動態調整）
+  majority_k_ratios: [0.50, 0.55, 0.60, 0.65, 0.70]
+
+# 策略類型配置
+strategy_types:
+  - "single"
+  - "dual"
+  - "RMA"
+  - "peaktrough"
+  - "ssma_turn"
+
+# 數據源配置
+data_sources:
+  - "Factor_TWII_2412.TW"
+  - "Factor_TWII_2414.TW"
+  - "Self"
+
+# 日誌設置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  file_pattern: "ensemble_{method}{scan_suffix}_{timestamp}.log"
+
+# 輸出文件命名模式
+output_patterns:
+  trades_file: "trades_from_results_{strategy}_{datasource}_trial{id}.csv"
+  ensemble_equity: "ensemble_equity_{method}_{timestamp}.csv"
+  ensemble_weights: "ensemble_weights_{method}_{timestamp}.csv"
+  ensemble_debug: "ensemble_debug_{method}_{timestamp}.csv"
+  ensemble_results: "ensemble_results_{method}_{timestamp}.txt"
+
+# 性能優化設置
+performance:
+  max_strategies: 30        # 最大策略數量
+  batch_size: 10           # 批處理大小
+  parallel_workers: 4      # 並行工作進程數
+  memory_limit_gb: 8       # 內存限制 (GB)
+
+# 質量檢查設置
+quality_checks:
+  min_score_threshold: 0.0     # 最低評分閾值
+  max_correlation: 0.95        # 最大相關性閾值
+  min_trades: 10               # 最少交易次數
+  min_periods: 252             # 最少回測期間（交易日）

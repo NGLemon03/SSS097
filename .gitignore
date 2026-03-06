@@ -1,0 +1,59 @@
+# Core ignores
+.history/
+cache/
+cache_v14/
+log/
+plots/
+results/
+pin/
+ui_baseline_*
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*.log
+*.zip
+re.csv
+re.txt
+# Local editor/tooling state
+.vscode/
+.claude/
+
+# Databases and heavy intermediate data
+*.db
+*.sqlite
+*.sqlite3
+data/
+backups/
+sss_backtest_outputs/
+
+# Backup-pattern files (default excluded; add with -f only when needed)
+*.bak
+*.corrupt_backup
+*.pre_rebuild_*
+backup_*
+*_backup_*
+!GIT_BACKUP_WORKFLOW.md
+
+# Analysis-specific local artifacts
+analysis/TSMAA/
+analysis/RMA/
+analysis/dual/
+analysis/single/
+analysis/Optuna/
+analysis/__pycache__/
+analysis/v2/
+analysis/v1_backup/
+analysis/old/
+analysis/grids/
+analysis/presets/
+analysis/cache/
+analysis/Optuna_5a.py
+analysis/test_parser.py
+analysis/*.csv
+analysis/*.html
+analysis/warehouse_*.json
+analysis/recommended_strategies.json
+
+# Keep the ignore file itself trackable
+!.gitignore
