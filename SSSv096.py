@@ -137,7 +137,7 @@ param_presets = {
 "Single 3": {"linlen": 80, "factor": 10, "smaalen": 60, "devwin": 20, "buy_mult": 0.4, "sell_mult": 1.5, "strategy_type": "single", "smaa_source": "Self"},
 "RMA_69": {"linlen": 151, "smaalen": 162, "rma_len": 55, "dev_len": 40, "factor": 40, "buy_mult": 1.4, "sell_mult": 3.15, "stop_loss": 0.1, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Factor (^TWII / 2414.TW)"},
 "RMA_669": {"linlen": 178, "smaalen": 112, "rma_len": 95, "dev_len": 95, "factor": 40, "buy_mult": 1.7, "sell_mult": 0.9, "stop_loss": 0.4, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Self"},
-"TV_RMAv2": {"linlen": 14, "smaalen": 120, "rma_len": 60, "dev_len": 20, "factor": 10, "buy_mult": 1.0, "sell_mult": 2.0, "stop_loss": 0.4, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Factor (^TWII / 2412.TW)", "trade_cooldown_bars": 5, "data_provider": "twse_db", "pine_parity_mode": True, "tv_alignment_mode": True},
+"TV_RMAv2": {"linlen": 14, "smaalen": 120, "rma_len": 60, "dev_len": 20, "factor": 10, "buy_mult": 1.0, "sell_mult": 2.0, "stop_loss": 0.4, "prom_factor": 0.5, "min_dist": 5, "strategy_type": "RMA", "smaa_source": "Factor (^TWII / 2412.TW)", "trade_cooldown_bars": 5, "data_provider": "yfinance", "pine_parity_mode": True, "tv_alignment_mode": True},
 "STM0": {"linlen": 25, "smaalen": 85, "factor": 80.0, "prom_factor": 9, "min_dist": 8, "buy_shift": 0, "exit_shift": 6, "vol_window": 90, "quantile_win": 65, "signal_cooldown_days": 7, "buy_mult": 0.15, "sell_mult": 0.1, "stop_loss": 0.13, "delta_cap": 0.3,
                 "strategy_type": "ssma_turn", "smaa_source": "Factor (^TWII / 2414.TW)"},
 "STM1": {"linlen": 15,"smaalen": 40,"factor": 40.0,"prom_factor": 70,"min_dist": 10,"buy_shift": 6,"exit_shift": 4,"vol_window": 40,"quantile_win": 65,
@@ -244,7 +244,7 @@ def fetch_yf_data(
 ) -> None:
     '從 Yahoo Finance 下載股價資料並存為 CSV，支援快取與自動更新。'
     now_taipei = pd.Timestamp.now(tz='Asia/Taipei')
-    update_midnight_taipei = now_taipei.normalize() + pd.Timedelta(days=1)
+    day_start_taipei = now_taipei.normalize()
     file_exists = filename.exists()
     proceed_with_fetch = True
 
@@ -260,11 +260,20 @@ def fetch_yf_data(
     if file_exists:
         file_mod_time_taipei = pd.to_datetime(os.path.getmtime(filename), unit='s', utc=True).tz_convert('Asia/Taipei')
         logger.info(f"檔案 {filename} 最後修改時間: {file_mod_time_taipei.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-        if (file_mod_time_taipei.date() == now_taipei.date() and file_mod_time_taipei >= update_midnight_taipei) or\
-           (now_taipei < update_midnight_taipei and file_mod_time_taipei >= (update_midnight_taipei - pd.Timedelta(days=1))):
-            logger.info(f"已強制更新 {ticker} 股價數據")
-            st.sidebar.success(f"{ticker} 股價資料已是最新")
-            proceed_with_fetch = False
+        same_day = (file_mod_time_taipei.normalize() == day_start_taipei)
+        tkr = str(ticker or "").upper()
+        is_tw_symbol = (".TW" in tkr) or (tkr in {"^TWII", "TAIEX", "FMTQIK.TAIEX"})
+        tw_close_cutoff = day_start_taipei + pd.Timedelta(hours=14, minutes=5)
+
+        if same_day:
+            # 同日資料預設視為最新；但台股收盤後若檔案仍是盤中快照，需重新抓取收盤值。
+            if is_tw_symbol and now_taipei >= tw_close_cutoff and file_mod_time_taipei < tw_close_cutoff:
+                logger.warning(f"{ticker} 今日資料疑似盤中快照（{file_mod_time_taipei.strftime('%H:%M:%S')}），準備更新收盤值")
+                st.sidebar.warning(f"{ticker} 今日資料疑似盤中快照，準備更新收盤值")
+            else:
+                logger.info(f"{ticker} 股價資料已是最新")
+                st.sidebar.success(f"{ticker} 股價資料已是最新")
+                proceed_with_fetch = False
         else:
             logger.warning(f"{ticker} 股價資料已過期，準備更新")
             st.sidebar.warning(f"{ticker} 股價資料已過期，準備更新")
@@ -312,8 +321,24 @@ def is_price_data_up_to_date(csv_path):
             last_date = pd.to_datetime(df['date'].iloc[-1])
         else:
             last_date = pd.to_datetime(df.iloc[-1, 0])
-        today = pd.Timestamp.now(tz='Asia/Taipei').normalize()
-        return last_date >= today
+        now_taipei = pd.Timestamp.now(tz='Asia/Taipei')
+        today = now_taipei.normalize()
+        last_day = pd.Timestamp(last_date).tz_localize(None).normalize()
+        if last_day < today.tz_localize(None):
+            return False
+        if last_day > today.tz_localize(None):
+            return True
+
+        # last_day == today：同日資料通常視為最新。
+        # 但台股在收盤後若檔案仍是盤中時間，視為過期，避免沿用盤中 close。
+        name = Path(str(csv_path)).name.upper()
+        is_tw_symbol = (".TW" in name) or ("^TWII" in name) or ("TAIEX" in name)
+        if is_tw_symbol:
+            close_cutoff = today + pd.Timedelta(hours=14, minutes=5)
+            file_mod_time_taipei = pd.to_datetime(os.path.getmtime(csv_path), unit='s', utc=True).tz_convert('Asia/Taipei')
+            if now_taipei >= close_cutoff and file_mod_time_taipei < close_cutoff:
+                return False
+        return True
     except Exception:
         return False
 
@@ -392,6 +417,103 @@ def _resolve_twse_db_path() -> Path:
         if path.exists():
             return path
     return candidates[0]
+
+
+_TWSE_DB_LAST_AUTO_ATTEMPT: Dict[str, pd.Timestamp] = {}
+
+
+def _fmtqik_max_date(db_path: Path) -> Optional[pd.Timestamp]:
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    try:
+        with sqlite3.connect(path) as conn:
+            row = conn.execute("SELECT MAX(date) FROM fmtqik").fetchone()
+    except Exception as e:
+        logger.warning(f"[twse_db] 讀取 fmtqik 最大日期失敗: {e}")
+        return None
+    if not row or not row[0]:
+        return None
+    ts = pd.to_datetime(row[0], errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts).normalize()
+
+
+def _prev_weekday(day: pd.Timestamp) -> pd.Timestamp:
+    d = pd.Timestamp(day).normalize()
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+
+def _expected_latest_fmtqik_date(now_taipei: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    now_taipei = pd.Timestamp(now_taipei) if now_taipei is not None else pd.Timestamp.now(tz="Asia/Taipei").tz_localize(None)
+    d = _prev_weekday(now_taipei.normalize())
+    close_cutoff = d + pd.Timedelta(hours=15)
+    if now_taipei < close_cutoff:
+        d = _prev_weekday(d - pd.Timedelta(days=1))
+    return d
+
+
+def _try_auto_update_twse_db(force_update: bool = False) -> bool:
+    """
+    依照 fmtqik 最新日期自動更新 twse_data.db。
+    - 非 force 模式：若資料落後於預期交易日才更新，且每天最多嘗試一次。
+    - force 模式：忽略每日節流，直接嘗試更新。
+    """
+    db_path = _resolve_twse_db_path()
+    now_taipei = pd.Timestamp.now(tz="Asia/Taipei").tz_localize(None)
+    today_key = now_taipei.normalize()
+    key = str(db_path.resolve())
+
+    if not force_update:
+        last_attempt = _TWSE_DB_LAST_AUTO_ATTEMPT.get(key)
+        if last_attempt is not None and last_attempt >= today_key:
+            return False
+
+    current_max = _fmtqik_max_date(db_path)
+    expected_latest = _expected_latest_fmtqik_date(now_taipei)
+    stale = force_update or (current_max is None) or (current_max < expected_latest)
+    if not stale:
+        return False
+
+    _TWSE_DB_LAST_AUTO_ATTEMPT[key] = today_key
+
+    try:
+        from TWSECrawler_SQ import TWSECrawler
+    except Exception as e:
+        logger.warning(f"[twse_db] 無法載入 TWSECrawler_SQ，略過自動更新: {e}")
+        return False
+
+    try:
+        logger.info(
+            "[twse_db] 自動更新啟動: db=%s, current_max=%s, expected=%s, force=%s",
+            db_path,
+            current_max.strftime("%Y-%m-%d") if current_max is not None else "None",
+            expected_latest.strftime("%Y-%m-%d"),
+            force_update,
+        )
+        # 保守延遲，避免太激進；通常只需補抓當月一次請求。
+        crawler = TWSECrawler(
+            db_path=db_path,
+            min_delay=1.0,
+            max_delay=2.0,
+            request_timeout=10,
+            max_retries=2,
+            retry_sleep_base=2,
+        )
+        crawler.fetch_fmtqik(start_year=2000)
+        new_max = _fmtqik_max_date(db_path)
+        logger.info(
+            "[twse_db] 自動更新完成: old=%s, new=%s",
+            current_max.strftime("%Y-%m-%d") if current_max is not None else "None",
+            new_max.strftime("%Y-%m-%d") if new_max is not None else "None",
+        )
+        return bool(new_max is not None and (current_max is None or new_max > current_max))
+    except Exception as e:
+        logger.warning(f"[twse_db] 自動更新失敗: {e}")
+        return False
 
 
 def _normalize_ohlcv_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -667,6 +789,24 @@ def _build_load_data_cache_signature(
     pine_parity_mode: bool = False,
 ) -> str:
     provider = str(data_provider or "yfinance").strip().lower()
+    files = _required_price_files_for_load_data(
+        ticker=ticker,
+        smaa_source=smaa_source,
+        data_provider=provider,
+        pine_parity_mode=pine_parity_mode,
+    )
+
+    payload = f"{provider}|{ticker}|{smaa_source}|pine={int(bool(pine_parity_mode))}|{'|'.join(_file_signature(p) for p in files)}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _required_price_files_for_load_data(
+    ticker: str,
+    smaa_source: str,
+    data_provider: str,
+    pine_parity_mode: bool = False,
+) -> List[Path]:
+    provider = str(data_provider or "yfinance").strip().lower()
     ticker_norm = str(ticker or "").strip().lower()
     file_suffix = "_data_raw_unadj.csv" if pine_parity_mode else "_data_raw.csv"
     files: List[Path] = []
@@ -683,9 +823,7 @@ def _build_load_data_cache_signature(
             files.append(_resolve_twse_db_path())
         else:
             files.append(DATA_DIR / "^TWII_data_raw.csv")
-
-    payload = f"{provider}|{ticker}|{smaa_source}|pine={int(bool(pine_parity_mode))}|{'|'.join(_file_signature(p) for p in files)}"
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    return files
 
 
 def load_data(
@@ -697,13 +835,36 @@ def load_data(
     data_provider: str = "yfinance",
     pine_parity_mode: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    provider_norm = str(data_provider or "yfinance").strip().lower()
+    ticker_norm = str(ticker or "").strip().lower()
+    uses_twse_fmtqik = _is_twse_db_provider(provider_norm) and (
+        ticker_norm in {"fmtqik.taiex", "taiex", "^twii"}
+        or smaa_source in {"Factor (^TWII / 2412.TW)", "Factor (^TWII / 2414.TW)"}
+    )
+    if uses_twse_fmtqik:
+        _try_auto_update_twse_db(force_update=bool(force_update))
+
     cache_signature = _build_load_data_cache_signature(
         ticker=ticker,
         smaa_source=smaa_source,
-        data_provider=data_provider,
+        data_provider=provider_norm,
         pine_parity_mode=pine_parity_mode,
     )
-    if force_update:
+    needs_refresh = bool(force_update)
+    if not needs_refresh:
+        for p in _required_price_files_for_load_data(
+            ticker=ticker,
+            smaa_source=smaa_source,
+            data_provider=provider_norm,
+            pine_parity_mode=pine_parity_mode,
+        ):
+            if p.suffix.lower() != ".csv":
+                continue
+            if not is_price_data_up_to_date(str(p)):
+                needs_refresh = True
+                break
+
+    if needs_refresh:
         cache_signature = f"{cache_signature}:{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
 
     return _load_data_cached(
@@ -711,8 +872,8 @@ def load_data(
         start_date=start_date,
         end_date=end_date,
         smaa_source=smaa_source,
-        force_update=force_update,
-        data_provider=data_provider,
+        force_update=needs_refresh,
+        data_provider=provider_norm,
         pine_parity_mode=pine_parity_mode,
         cache_signature=cache_signature,
     )
@@ -900,10 +1061,26 @@ def compute_ssma_turn_combined(
     df: pd.DataFrame, smaa_source_df: pd.DataFrame, linlen: int, factor: float,
     smaalen: int, prom_factor: float, min_dist: int, buy_shift: int = 0, exit_shift: int = 0, vol_window: int = 20,
     signal_cooldown_days: int = 10, quantile_win: int = 100,
-    smaa_source: str = "Self"
+    smaa_source: str = "Self",
+    signal_filter_mode: str = "volume_ma",
+    volume_target_pass_rate: Optional[float] = None,
+    volume_target_lookback: int = 120,
 ) -> Tuple[pd.DataFrame, List[pd.Timestamp], List[pd.Timestamp]]:
-    logger.info('compute_ssma_turn_combined: linlen=%d, factor=%.1f, smaalen=%d, prom_factor=%.1f, min_dist=%d, buy_shift=%d, exit_shift=%d, vol_window=%d, quantile_win=%d, cooldown=%d',
-                linlen, factor, smaalen, prom_factor, min_dist, buy_shift, exit_shift, vol_window, quantile_win, signal_cooldown_days)
+    logger.info(
+        "compute_ssma_turn_combined: linlen=%d, factor=%.1f, smaalen=%d, prom_factor=%.1f, min_dist=%d, "
+        "buy_shift=%d, exit_shift=%d, vol_window=%d, quantile_win=%d, cooldown=%d, filter=%s",
+        linlen,
+        factor,
+        smaalen,
+        prom_factor,
+        min_dist,
+        buy_shift,
+        exit_shift,
+        vol_window,
+        quantile_win,
+        signal_cooldown_days,
+        str(signal_filter_mode),
+    )
 
     # 參數型別轉換與驗證
     try:
@@ -915,18 +1092,38 @@ def compute_ssma_turn_combined(
         signal_cooldown_days = int(signal_cooldown_days)
         buy_shift = int(buy_shift)
         exit_shift = int(exit_shift)
+        volume_target_lookback = int(volume_target_lookback)
+        if volume_target_pass_rate is not None:
+            volume_target_pass_rate = float(volume_target_pass_rate)
         if min_dist < 1 or vol_window < 1 or quantile_win < 1 or signal_cooldown_days < 0:
             raise ValueError("Invalid ssma_turn parameter range")
+        if volume_target_lookback < 1:
+            raise ValueError("Invalid volume_target_lookback")
+        if volume_target_pass_rate is not None and not (0.0 < volume_target_pass_rate <= 1.0):
+            raise ValueError("volume_target_pass_rate must be in (0, 1]")
     except (ValueError, TypeError) as e:
         logger.error(f"ssma_turn 參數驗證失敗: {e}")
         st.error(f"ssma_turn 參數驗證失敗: {e}")
         return pd.DataFrame(), [], []
 
+    filter_mode_raw = str(signal_filter_mode or "volume_ma").strip().lower()
+    if filter_mode_raw in {"none", "off", "disable", "disabled", "no_volume"}:
+        signal_filter_mode = "none"
+    elif filter_mode_raw in {"volume_target", "adaptive_volume", "volume_quantile"}:
+        signal_filter_mode = "volume_target"
+    else:
+        signal_filter_mode = "volume_ma"
+    needs_volume_gate = signal_filter_mode in {"volume_ma", "volume_target"}
+
     # 選擇資料來源並檢查必要欄位
     source_df = smaa_source_df if not smaa_source_df.empty else df
-    if 'close' not in source_df.columns or 'volume' not in source_df.columns:
-        logger.error('資料來源缺少 close 或 volume 欄位')
-        st.error('資料來源缺少 close 或 volume 欄位')
+    if 'close' not in source_df.columns:
+        logger.error('資料來源缺少 close 欄位')
+        st.error('資料來源缺少 close 欄位')
+        return pd.DataFrame(), [], []
+    if needs_volume_gate and 'volume' not in df.columns:
+        logger.error('主標的資料缺少 volume 欄位，無法進行量能濾網')
+        st.error('主標的資料缺少 volume 欄位，無法進行量能濾網')
         return pd.DataFrame(), [], []
 
     df_cleaned = source_df.dropna(subset=['close'])
@@ -980,21 +1177,58 @@ def compute_ssma_turn_combined(
                 if valley_date not in valleys:  # 去重
                     valleys.append(valley_date)
 
-    # 成交量過濾：僅保留成交量高於均量的訊號
-    vol_ma = df['volume'].rolling(vol_window, min_periods=vol_window).mean().shift(1)
-    valid_peaks = []
-    valid_valleys = []
-    for p in peaks:
-        if p in vol_ma.index and p in df.index:
-            v = df.loc[p, 'volume']
-            vol_avg = vol_ma.loc[p]
-            if pd.notna(v) and pd.notna(vol_avg) and v > vol_avg:
+    # 訊號濾網：volume_ma（舊邏輯）/ volume_target（目標通過率）/ none（不做量能過濾）
+    valid_peaks: List[pd.Timestamp] = []
+    valid_valleys: List[pd.Timestamp] = []
+    if signal_filter_mode == "none":
+        valid_peaks = list(peaks)
+        valid_valleys = list(valleys)
+    else:
+        vol_series = pd.to_numeric(df['volume'], errors='coerce')
+        vol_ma = vol_series.rolling(vol_window, min_periods=vol_window).mean().shift(1)
+        vol_ratio = vol_series / vol_ma.replace(0, np.nan)
+
+        target_threshold_series = pd.Series(np.nan, index=df.index, dtype=float)
+        fallback_threshold = np.nan
+        if signal_filter_mode == "volume_target":
+            target_pass = 0.35 if volume_target_pass_rate is None else float(volume_target_pass_rate)
+            target_pass = min(max(target_pass, 0.05), 1.0)
+            q = max(0.0, min(1.0, 1.0 - target_pass))
+            lookback = max(int(volume_target_lookback), vol_window + 5)
+            min_obs = max(10, min(lookback, vol_window + 10))
+            target_threshold_series = vol_ratio.rolling(
+                window=lookback,
+                min_periods=min_obs,
+            ).quantile(q).shift(1)
+            ratio_valid = vol_ratio.dropna()
+            if not ratio_valid.empty:
+                fallback_threshold = float(ratio_valid.quantile(q))
+            if pd.isna(fallback_threshold):
+                fallback_threshold = 1.0
+
+        def _passes_filter(ts: pd.Timestamp) -> bool:
+            if ts not in df.index or ts not in vol_ma.index:
+                return False
+            v = vol_series.loc[ts]
+            vol_avg = vol_ma.loc[ts]
+            if pd.isna(v) or pd.isna(vol_avg) or vol_avg <= 0:
+                return False
+            if signal_filter_mode == "volume_ma":
+                return bool(v > vol_avg)
+
+            ratio = vol_ratio.loc[ts]
+            if pd.isna(ratio):
+                return False
+            threshold = target_threshold_series.loc[ts] if ts in target_threshold_series.index else np.nan
+            if pd.isna(threshold):
+                threshold = fallback_threshold
+            return bool(pd.notna(threshold) and ratio > threshold)
+
+        for p in peaks:
+            if _passes_filter(p):
                 valid_peaks.append(p)
-    for v in valleys:
-        if v in vol_ma.index and v in df.index:
-            v_vol = df.loc[v, 'volume']
-            vol_avg = vol_ma.loc[v]
-            if pd.notna(v_vol) and pd.notna(vol_avg) and v_vol > vol_avg:
+        for v in valleys:
+            if _passes_filter(v):
                 valid_valleys.append(v)
 
     # 套用訊號冷卻期
@@ -1450,12 +1684,12 @@ def backtest_unified(
             trade_ret = (exit_price / entry_price) - 1 - ROUND_TRIP_FEE - (accum_interest / (entry_price * total_shares)) if entry_price != 0 and total_shares > 0 else 0
             if bad_holding and trade_ret < -0.20 and not scheduled_forced[i]:
                 continue
-            cash += total_shares * exit_price
             sell_shares = total_shares
             sell_notional = float(sell_shares * exit_price)
             sell_fee_amt = sell_notional * sell_fee_rate_only
             sell_tax_amt = sell_notional * sell_tax_rate_only
             sell_net_amount = sell_notional - sell_fee_amt - sell_tax_amt
+            cash += sell_net_amount
             total_shares = 0
             if use_leverage and lev.loan > 0:
                 repay_amt = min(cash, lev.loan)
@@ -1512,21 +1746,23 @@ def backtest_unified(
             signal_reason = str(scheduled_buy_reason[i] or f"{strategy_type}_buy")
             ind_smaa, ind_base, ind_sd = _indicator_triplet(signal_dt)
 
-            shares = int(cash // today_open)
+            unit_total_cost = today_open * (1.0 + BUY_FEE_RATE)
+            shares = int(cash // unit_total_cost) if unit_total_cost > 0 else 0
             if shares > 0:
                 need_cash = shares * today_open
                 buy_notional = float(need_cash)
                 buy_fee_amt = buy_notional * BUY_FEE_RATE
                 buy_net_amount = -(buy_notional + buy_fee_amt)
+                total_buy_cost = need_cash + buy_fee_amt
                 if use_leverage:
-                    gap = need_cash - cash
+                    gap = total_buy_cost - cash
                     if gap > 0:
                         borrowable = lev.avail(mkt_val=mkt_val)
                         draw = min(gap, borrowable)
                         if draw > 0:
                             lev.borrow(draw)
                             cash += draw
-                cash -= need_cash
+                cash -= total_buy_cost
                 total_shares = shares
                 entry_price = today_open
                 entry_date = today
@@ -1571,6 +1807,38 @@ def backtest_unified(
     trades_df = pd.DataFrame(trades, columns=['entry_date', 'ret', 'exit_date'])
     signals_df = pd.DataFrame(signals)
     metrics = calculate_metrics(trades, df_ind, equity_curve)
+
+    # 以 equity_curve 回填核心績效，確保與每日淨值口徑一致（含費稅後現金流）
+    eq_clean = pd.to_numeric(equity_curve, errors='coerce').dropna()
+    if len(eq_clean) >= 2:
+        total_return_eq = float(eq_clean.iloc[-1] / eq_clean.iloc[0] - 1.0)
+        days_eq = max((eq_clean.index[-1] - eq_clean.index[0]).days, 1)
+        years_eq = max(days_eq / 365.25, 1e-9)
+        annual_return_eq = float((1 + total_return_eq) ** (1 / years_eq) - 1)
+        dd_eq = eq_clean / eq_clean.cummax() - 1.0
+        mdd_eq = float(dd_eq.min())
+
+        daily_ret_eq = eq_clean.pct_change().dropna()
+        sharpe_eq = np.nan
+        sortino_eq = np.nan
+        ann_vol_eq = np.nan
+        if not daily_ret_eq.empty:
+            vol = float(daily_ret_eq.std(ddof=0))
+            if vol > 0:
+                sharpe_eq = float(daily_ret_eq.mean() / vol * np.sqrt(252))
+                ann_vol_eq = float(vol * np.sqrt(252))
+            downside = daily_ret_eq[daily_ret_eq < 0]
+            down_vol = float(downside.std(ddof=0)) if not downside.empty else 0.0
+            if down_vol > 0:
+                sortino_eq = float(daily_ret_eq.mean() / down_vol * np.sqrt(252))
+
+        metrics['total_return'] = total_return_eq
+        metrics['annual_return'] = annual_return_eq
+        metrics['max_drawdown'] = mdd_eq
+        metrics['calmar_ratio'] = annual_return_eq / abs(mdd_eq) if mdd_eq < 0 else np.nan
+        metrics['sharpe_ratio'] = sharpe_eq
+        metrics['sortino_ratio'] = sortino_eq
+        metrics['annualized_volatility'] = ann_vol_eq
 
     # 組合每日狀態
     daily_state = pd.DataFrame({
@@ -1639,7 +1907,11 @@ def compute_backtest_for_periods(ticker: str,periods: List[Tuple[str, str]],stra
             continue
 
         if strategy_type == 'ssma_turn':
-            calc_keys = ['linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist', 'buy_shift', 'exit_shift', 'vol_window', 'quantile_win', 'signal_cooldown_days']
+            calc_keys = [
+                'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                'buy_shift', 'exit_shift', 'vol_window', 'quantile_win', 'signal_cooldown_days',
+                'signal_filter_mode', 'volume_target_pass_rate', 'volume_target_lookback',
+            ]
             ssma_params = {k: v for k, v in params.items() if k in calc_keys}
             df_ind, buy_dates, sell_dates = compute_ssma_turn_combined(df_raw, df_factor_slice, **ssma_params)
             if df_ind.empty:
@@ -2361,9 +2633,12 @@ def run_app():
 
                     # 執行回測
                     if strategy_type == 'ssma_turn':
-                        calc_keys = ['linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
-                                     'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days',
-                                     'quantile_win']
+                        calc_keys = [
+                            'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                            'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days',
+                            'quantile_win', 'signal_filter_mode', 'volume_target_pass_rate',
+                            'volume_target_lookback',
+                        ]
                         ssma_params = {k: v for k, v in params.items() if k in calc_keys}
                         backtest_params = ssma_params.copy()
                         backtest_params['stop_loss'] = params.get('stop_loss', 0.0)
@@ -2476,7 +2751,11 @@ pine_parity_mode=bool(params.get("pine_parity_mode", False))
                 )
 
                 if strategy_type == 'ssma_turn':
-                    calc_keys = ['linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist', 'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days', 'quantile_win']
+                    calc_keys = [
+                        'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                        'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days', 'quantile_win',
+                        'signal_filter_mode', 'volume_target_pass_rate', 'volume_target_lookback',
+                    ]
                     ssma_params = {k: v for k, v in params.items() if k in calc_keys}
                     backtest_params = ssma_params.copy()
                     backtest_params['stop_loss'] = params.get('stop_loss', 0.0)
@@ -2567,9 +2846,12 @@ pine_parity_mode=bool(params.get("pine_parity_mode", False))
 
             # 依策略類型計算指標並回測
             if strategy_type == 'ssma_turn':
-                calc_keys = ['linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
-                             'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days',
-                             'quantile_win']
+                calc_keys = [
+                    'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
+                    'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days',
+                    'quantile_win', 'signal_filter_mode', 'volume_target_pass_rate',
+                    'volume_target_lookback',
+                ]
                 ssma_params = {k: v for k, v in params.items() if k in calc_keys}
                 backtest_params = ssma_params.copy()
                 backtest_params['stop_loss'] = params.get('stop_loss', 0.0)

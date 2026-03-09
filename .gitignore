@@ -1,4 +1,4 @@
-# Core ignores
+﻿# ?詨?敹賜閬?
 .history/
 cache/
 cache_v14/
@@ -15,11 +15,10 @@ __pycache__/
 *.zip
 re.csv
 re.txt
-# Local editor/tooling state
-.vscode/
+# ?砍蝺刻摩??撌亙???.vscode/
 .claude/
 
-# Databases and heavy intermediate data
+# ?豢?摨怠???銝剝??豢?
 *.db
 *.sqlite
 *.sqlite3
@@ -27,15 +26,13 @@ data/
 backups/
 sss_backtest_outputs/
 
-# Backup-pattern files (default excluded; add with -f only when needed)
-*.bak
+# ?遢?辣???隞?*.bak
 *.corrupt_backup
 *.pre_rebuild_*
 backup_*
 *_backup_*
-!GIT_BACKUP_WORKFLOW.md
 
-# Analysis-specific local artifacts
+# ???辣???冗
 analysis/TSMAA/
 analysis/RMA/
 analysis/dual/
@@ -55,5 +52,5 @@ analysis/*.html
 analysis/warehouse_*.json
 analysis/recommended_strategies.json
 
-# Keep the ignore file itself trackable
+# 敹賜?芾澈??gitignore?辣嚗誑蝣箔?摰◤??批蝟餌絞頝葵
 !.gitignore

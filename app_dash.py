@@ -9,15 +9,16 @@ from dash.dependencies import ALL
 import shutil
 import os
 import sys
-import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 import joblib
 from analysis import config as cfg
+from analysis.daily_param_signals import build_daily_signal_context, run_daily_param_signals
 import yfinance as yf
 import logging
 import numpy as np
 from urllib.parse import quote as urlparse
+from typing import Any, Dict, Optional
 try:
     from analysis.strategy_manager import manager
 except ImportError:
@@ -621,6 +622,478 @@ def _build_benchmark_df(df_raw):
 
     return bench
 
+
+def _calc_nav_relative_ratio(daily_state_df: pd.DataFrame, df_raw: pd.DataFrame) -> float:
+    """
+    計算 NAV 相對淨值比（BH=1 基準）：
+    ratio = (strategy_nav_end / strategy_nav_start) / (benchmark_close_end / benchmark_close_start)
+    """
+    try:
+        if daily_state_df is None or df_raw is None:
+            return np.nan
+        if not isinstance(daily_state_df, pd.DataFrame) or not isinstance(df_raw, pd.DataFrame):
+            return np.nan
+        if daily_state_df.empty or df_raw.empty or "equity" not in daily_state_df.columns:
+            return np.nan
+
+        close_col = None
+        for c in ("close", "Close", "收盤價"):
+            if c in df_raw.columns:
+                close_col = c
+                break
+        if close_col is None:
+            return np.nan
+
+        eq = pd.to_numeric(daily_state_df["equity"], errors="coerce").dropna()
+        close_s = pd.to_numeric(df_raw[close_col], errors="coerce").dropna()
+        if eq.empty or close_s.empty:
+            return np.nan
+
+        eq.index = pd.to_datetime(eq.index, errors="coerce")
+        close_s.index = pd.to_datetime(close_s.index, errors="coerce")
+        eq = eq[~eq.index.isna()]
+        close_s = close_s[~close_s.index.isna()]
+        if isinstance(eq.index, pd.DatetimeIndex) and eq.index.tz is not None:
+            eq.index = eq.index.tz_localize(None)
+        if isinstance(close_s.index, pd.DatetimeIndex) and close_s.index.tz is not None:
+            close_s.index = close_s.index.tz_localize(None)
+
+        idx = eq.index.intersection(close_s.index)
+        if len(idx) < 2:
+            return np.nan
+
+        eq = eq.loc[idx]
+        close_s = close_s.loc[idx]
+        eq_start = float(eq.iloc[0])
+        eq_end = float(eq.iloc[-1])
+        px_start = float(close_s.iloc[0])
+        px_end = float(close_s.iloc[-1])
+        if eq_start <= 0 or px_start <= 0 or not np.isfinite(eq_end) or not np.isfinite(px_end):
+            return np.nan
+
+        strategy_nav = eq_end / eq_start
+        benchmark_nav = px_end / px_start
+        if benchmark_nav <= 0 or not np.isfinite(strategy_nav) or not np.isfinite(benchmark_nav):
+            return np.nan
+        return float(strategy_nav / benchmark_nav)
+    except Exception:
+        return np.nan
+
+
+def _compute_ssma_prominence_threshold(
+    smaa: pd.Series,
+    min_dist: int,
+    quantile_win: int,
+    prom_factor: float,
+) -> pd.Series:
+    """重建 ssma_turn 每日 prominence 門檻序列（僅供 UI 繪圖）。"""
+    if smaa is None or len(smaa) == 0:
+        return pd.Series(dtype=float)
+
+    smaa_num = pd.to_numeric(smaa, errors="coerce")
+    series_clean = smaa_num.dropna()
+    if series_clean.empty:
+        return pd.Series(index=smaa_num.index, dtype=float)
+
+    min_dist_i = max(int(min_dist or 1), 1)
+    quantile_win_i = max(int(quantile_win or (min_dist_i + 1)), min_dist_i + 1)
+    q = float(prom_factor or 50.0) / 100.0
+    q = min(max(q, 0.0), 1.0)
+
+    prom = series_clean.rolling(
+        window=min_dist_i + 1,
+        min_periods=min_dist_i + 1,
+    ).apply(lambda x: np.ptp(x), raw=True)
+
+    prom_valid = prom.dropna()
+    if prom_valid.empty:
+        return pd.Series(index=smaa_num.index, dtype=float)
+
+    initial_threshold = float(prom_valid.quantile(q))
+    threshold_series = (
+        prom.rolling(window=quantile_win_i, min_periods=quantile_win_i)
+        .quantile(q)
+        .shift(1)
+        .ffill()
+        .fillna(initial_threshold)
+    )
+    return threshold_series.reindex(smaa_num.index)
+
+
+def _build_indicator_daily_frame(
+    df_ind: pd.DataFrame,
+    strategy_type: str,
+    params: dict,
+    buy_dates: Optional[list] = None,
+    sell_dates: Optional[list] = None,
+) -> pd.DataFrame:
+    """產生每日 SMAA 與閥值資料，供 Dash 顯示。"""
+    if df_ind is None or df_ind.empty or "smaa" not in df_ind.columns:
+        return pd.DataFrame()
+
+    ind = df_ind.copy()
+    ind.index = pd.to_datetime(ind.index, errors="coerce")
+    ind = ind[ind.index.notna()].sort_index()
+    if ind.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=ind.index)
+    out["smaa"] = pd.to_numeric(ind["smaa"], errors="coerce")
+
+    stype = str(strategy_type or "").strip().lower()
+    if stype in {"single", "dual", "rma"} and {"base", "sd"}.issubset(ind.columns):
+        base = pd.to_numeric(ind["base"], errors="coerce")
+        sd = pd.to_numeric(ind["sd"], errors="coerce")
+        buy_mult = float(params.get("buy_mult", 1.0))
+        sell_mult = float(params.get("sell_mult", 1.0))
+        pine_parity_mode = bool(params.get("pine_parity_mode", False))
+
+        out["base"] = base
+        out["buy_threshold"] = base - sd * buy_mult if pine_parity_mode else base + sd * buy_mult
+        out["sell_threshold"] = base + sd * sell_mult
+    elif stype == "ssma_turn":
+        out["prom_threshold"] = _compute_ssma_prominence_threshold(
+            out["smaa"],
+            min_dist=int(params.get("min_dist", 5)),
+            quantile_win=int(params.get("quantile_win", 100)),
+            prom_factor=float(params.get("prom_factor", 50.0)),
+        )
+        buy_set = set(pd.to_datetime(buy_dates or [], errors="coerce"))
+        sell_set = set(pd.to_datetime(sell_dates or [], errors="coerce"))
+        out["is_buy_signal"] = out.index.isin(buy_set)
+        out["is_sell_signal"] = out.index.isin(sell_set)
+
+    return out.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+
+
+def _extract_latest_t_signal(
+    strategy_type: str,
+    indicator_daily: Optional[pd.DataFrame] = None,
+    daily_state: Optional[pd.DataFrame] = None,
+    trade_df: Optional[pd.DataFrame] = None,
+    trade_cooldown_bars: int = 0,
+) -> Dict[str, Any]:
+    """計算策略訊號快照：最後可用日可執行訊號 + 最近一次已發出訊號。"""
+    stype = str(strategy_type or "").strip().lower()
+    out: Dict[str, Any] = {
+        "signal": "HOLD",
+        "data_date": "",
+        "reason": "",
+        "last_signal": "HOLD",
+        "last_signal_date": "",
+        "last_signal_reason": "",
+    }
+
+    # 交易紀錄：用來對齊「上次已發出訊號」與買入冷卻條件
+    last_trade_date: Optional[pd.Timestamp] = None
+    last_exec_side: Optional[str] = None
+    trades = trade_df.copy() if isinstance(trade_df, pd.DataFrame) else pd.DataFrame()
+    if not trades.empty:
+        trades.columns = [str(c).lower() for c in trades.columns]
+        if "trade_date" in trades.columns:
+            trades["trade_date"] = pd.to_datetime(trades["trade_date"], errors="coerce")
+        if "signal_date" in trades.columns:
+            trades["signal_date"] = pd.to_datetime(trades["signal_date"], errors="coerce")
+        if "type" not in trades.columns and "action" in trades.columns:
+            trades["type"] = trades["action"].astype(str)
+        if "type" in trades.columns:
+            t = trades["type"].astype(str).str.lower()
+            side = pd.Series("OTHER", index=trades.index, dtype=object)
+            side[t.str.contains("buy|add|long", na=False)] = "BUY"
+            side[t.str.contains("sell|exit", na=False)] = "SELL"
+            trades["side_norm"] = side
+            exec_rows = trades[trades["side_norm"].isin(["BUY", "SELL"])].copy()
+            if not exec_rows.empty:
+                exec_rows = exec_rows.sort_values("trade_date")
+                last_row = exec_rows.iloc[-1]
+                last_exec_side = str(last_row["side_norm"])
+                sig_dt = last_row.get("signal_date")
+                trd_dt = last_row.get("trade_date")
+                if pd.notna(sig_dt):
+                    out["last_signal_date"] = pd.Timestamp(sig_dt).strftime("%Y-%m-%d")
+                elif pd.notna(trd_dt):
+                    out["last_signal_date"] = pd.Timestamp(trd_dt).strftime("%Y-%m-%d")
+                out["last_signal"] = last_exec_side
+                out["last_signal_reason"] = "已執行的最後訊號"
+                if pd.notna(trd_dt):
+                    last_trade_date = pd.Timestamp(trd_dt)
+
+    # 推估目前是否持倉（以每日狀態優先）
+    in_position = False
+    ds = daily_state.copy() if isinstance(daily_state, pd.DataFrame) else pd.DataFrame()
+    if not ds.empty:
+        ds.index = pd.to_datetime(ds.index, errors="coerce")
+        ds = ds[ds.index.notna()].sort_index()
+        if "w" in ds.columns:
+            w_s = pd.to_numeric(ds["w"], errors="coerce").dropna()
+            if not w_s.empty:
+                in_position = bool(float(w_s.iloc[-1]) > 1e-6)
+        elif "shares" in ds.columns:
+            shares_s = pd.to_numeric(ds["shares"], errors="coerce").dropna()
+            if not shares_s.empty:
+                in_position = bool(float(shares_s.iloc[-1]) > 0)
+        elif "position_value" in ds.columns:
+            pos_s = pd.to_numeric(ds["position_value"], errors="coerce").dropna()
+            if not pos_s.empty:
+                in_position = bool(float(pos_s.iloc[-1]) > 0)
+    elif last_exec_side is not None:
+        in_position = bool(last_exec_side == "BUY")
+
+    def _bars_since_last_trade(ref_index: pd.DatetimeIndex) -> Optional[int]:
+        if last_trade_date is None or ref_index.empty:
+            return None
+        idx = pd.DatetimeIndex(pd.to_datetime(ref_index, errors="coerce"))
+        idx = idx[~idx.isna()]
+        if idx.empty:
+            return None
+        pos_now = len(idx) - 1
+        pos_last = idx.searchsorted(last_trade_date, side="right") - 1
+        if pos_last < 0:
+            return None
+        return int(pos_now - pos_last)
+
+    def _apply_actionable_filter(raw_signal: str, raw_reason: str, ref_index: pd.DatetimeIndex) -> tuple[str, str]:
+        sig = str(raw_signal).upper()
+        reason = str(raw_reason)
+        if sig == "BUY":
+            if in_position:
+                return "HOLD", "已有持倉不再買"
+            bars = _bars_since_last_trade(ref_index)
+            if bars is not None and int(trade_cooldown_bars or 0) > 0 and bars <= int(trade_cooldown_bars):
+                return "HOLD", "交易冷卻中"
+            return "BUY", reason
+        if sig == "SELL":
+            if not in_position:
+                return "HOLD", "無持倉可賣"
+            return "SELL", reason
+        return "HOLD", reason
+
+    if stype == "ensemble":
+        if ds.empty or "w" not in ds.columns:
+            return out
+        w = pd.to_numeric(ds["w"], errors="coerce").dropna()
+        if w.empty:
+            return out
+        out["data_date"] = w.index[-1].strftime("%Y-%m-%d")
+        if len(w) >= 2:
+            dw_s = w.diff().fillna(0.0)
+            sig_s = pd.Series("HOLD", index=dw_s.index, dtype=object)
+            sig_s[dw_s > 1e-12] = "BUY"
+            sig_s[dw_s < -1e-12] = "SELL"
+            out["signal"] = str(sig_s.iloc[-1])
+            out["reason"] = ""
+            non_hold = sig_s[sig_s != "HOLD"]
+            if not non_hold.empty:
+                if not out["last_signal_date"]:
+                    out["last_signal"] = str(non_hold.iloc[-1])
+                    out["last_signal_date"] = non_hold.index[-1].strftime("%Y-%m-%d")
+                    out["last_signal_reason"] = "w_t - w_(t-1)"
+        else:
+            out["reason"] = "單一資料點無法判斷訊號變化"
+        return out
+
+    ind = indicator_daily.copy() if isinstance(indicator_daily, pd.DataFrame) else pd.DataFrame()
+    if ind.empty or "smaa" not in ind.columns:
+        return out
+    ind.index = pd.to_datetime(ind.index, errors="coerce")
+    ind = ind[ind.index.notna()].sort_index()
+    if ind.empty:
+        return out
+
+    row = ind.iloc[-1]
+    smaa = pd.to_numeric(pd.Series([row.get("smaa")]), errors="coerce").iloc[0]
+    if pd.isna(smaa):
+        return out
+
+    out["data_date"] = ind.index[-1].strftime("%Y-%m-%d")
+    if stype in {"single", "dual", "rma"}:
+        buy_th = pd.to_numeric(pd.Series([row.get("buy_threshold")]), errors="coerce").iloc[0]
+        sell_th = pd.to_numeric(pd.Series([row.get("sell_threshold")]), errors="coerce").iloc[0]
+        sig_s = pd.Series("HOLD", index=ind.index, dtype=object)
+        if "buy_threshold" in ind.columns:
+            buy_mask = pd.to_numeric(ind["smaa"], errors="coerce") < pd.to_numeric(ind["buy_threshold"], errors="coerce")
+            sig_s[buy_mask.fillna(False)] = "BUY"
+        if "sell_threshold" in ind.columns:
+            sell_mask = pd.to_numeric(ind["smaa"], errors="coerce") > pd.to_numeric(ind["sell_threshold"], errors="coerce")
+            sig_s[sell_mask.fillna(False)] = "SELL"
+
+        raw_now = "HOLD"
+        raw_reason = "在買賣閥值之間"
+        if pd.notna(buy_th) and smaa < buy_th:
+            raw_now = "BUY"
+            raw_reason = "smaa小於買入閥值"
+        elif pd.notna(sell_th) and smaa > sell_th:
+            raw_now = "SELL"
+            raw_reason = "smaa大於賣出閥值"
+        out["signal"], out["reason"] = _apply_actionable_filter(raw_now, raw_reason, ind.index)
+
+        non_hold = sig_s[sig_s != "HOLD"]
+        if not non_hold.empty and not out["last_signal_date"]:
+            out["last_signal"] = str(non_hold.iloc[-1])
+            out["last_signal_date"] = non_hold.index[-1].strftime("%Y-%m-%d")
+            ls = out["last_signal"]
+            out["last_signal_reason"] = (
+                "smaa小於買入閥值" if ls == "BUY" else "smaa大於賣出閥值"
+            )
+        return out
+
+    if stype == "ssma_turn":
+        is_buy_series = pd.Series(ind.get("is_buy_signal", False), index=ind.index).astype(bool)
+        is_sell_series = pd.Series(ind.get("is_sell_signal", False), index=ind.index).astype(bool)
+        sig_s = pd.Series("HOLD", index=ind.index, dtype=object)
+        sig_s[is_buy_series] = "BUY"
+        sig_s[is_sell_series] = "SELL"
+
+        raw_now = "HOLD"
+        raw_reason = "無轉折訊號"
+        is_buy = bool(is_buy_series.iloc[-1])
+        is_sell = bool(is_sell_series.iloc[-1])
+        if is_buy and not is_sell:
+            raw_now = "BUY"
+            raw_reason = "轉折向上訊號"
+        elif is_sell and not is_buy:
+            raw_now = "SELL"
+            raw_reason = "轉折向下訊號"
+        out["signal"], out["reason"] = _apply_actionable_filter(raw_now, raw_reason, ind.index)
+
+        non_hold = sig_s[sig_s != "HOLD"]
+        if not non_hold.empty and not out["last_signal_date"]:
+            out["last_signal"] = str(non_hold.iloc[-1])
+            out["last_signal_date"] = non_hold.index[-1].strftime("%Y-%m-%d")
+            out["last_signal_reason"] = (
+                "轉折向上訊號" if out["last_signal"] == "BUY" else "轉折向下訊號"
+            )
+        return out
+
+    return out
+
+
+def _create_daily_smaa_threshold_figure(
+    indicator_df: pd.DataFrame,
+    strategy_name: str,
+    strategy_type: str,
+    theme: str,
+) -> go.Figure:
+    """建立每日 SMAA 與閥值圖（非 Ensemble 策略）。"""
+    fig = go.Figure()
+    if indicator_df is None or indicator_df.empty:
+        fig.update_layout(
+            title=f"{strategy_name} 每日 SMAA / 閥值（無資料）",
+            template="plotly_white",
+            height=320,
+        )
+        return fig
+
+    ind = indicator_df.copy()
+    ind.index = pd.to_datetime(ind.index, errors="coerce")
+    ind = ind[ind.index.notna()].sort_index()
+    if ind.empty:
+        fig.update_layout(
+            title=f"{strategy_name} 每日 SMAA / 閥值（無資料）",
+            template="plotly_white",
+            height=320,
+        )
+        return fig
+
+    if theme == "theme-light":
+        template = "plotly_white"
+        paper_bg = "#ffffff"
+        plot_bg = "#ffffff"
+        font_color = "#212529"
+        grid_color = "rgba(70, 70, 70, 0.16)"
+    elif theme == "theme-blue":
+        template = "plotly_dark"
+        paper_bg = "#001a33"
+        plot_bg = "#001a33"
+        font_color = "#ffe066"
+        grid_color = "rgba(255, 224, 102, 0.18)"
+    else:
+        template = "plotly_dark"
+        paper_bg = "#121212"
+        plot_bg = "#121212"
+        font_color = "#e0e0e0"
+        grid_color = "rgba(224, 224, 224, 0.14)"
+
+    fig.add_trace(
+        go.Scatter(
+            x=ind.index,
+            y=pd.to_numeric(ind.get("smaa"), errors="coerce"),
+            name="SMAA",
+            mode="lines",
+            line=dict(color="#4dabf7", width=1.8),
+        )
+    )
+
+    stype = str(strategy_type or "").strip().lower()
+    if stype in {"single", "dual", "rma"}:
+        if "base" in ind.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=ind.index,
+                    y=pd.to_numeric(ind["base"], errors="coerce"),
+                    name="基準線",
+                    mode="lines",
+                    line=dict(color="#f59f00", width=1.3),
+                )
+            )
+        if "buy_threshold" in ind.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=ind.index,
+                    y=pd.to_numeric(ind["buy_threshold"], errors="coerce"),
+                    name="買入閥值",
+                    mode="lines",
+                    line=dict(color="#40c057", width=1.2, dash="dot"),
+                )
+            )
+        if "sell_threshold" in ind.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=ind.index,
+                    y=pd.to_numeric(ind["sell_threshold"], errors="coerce"),
+                    name="賣出閥值",
+                    mode="lines",
+                    line=dict(color="#fa5252", width=1.2, dash="dash"),
+                )
+            )
+    elif stype == "ssma_turn" and "prom_threshold" in ind.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=ind.index,
+                y=pd.to_numeric(ind["prom_threshold"], errors="coerce"),
+                name="Prominence 閥值",
+                mode="lines",
+                yaxis="y2",
+                line=dict(color="#ffd43b", width=1.2, dash="dash"),
+            )
+        )
+
+    layout_kwargs = {}
+    if stype == "ssma_turn" and "prom_threshold" in ind.columns:
+        layout_kwargs["yaxis2"] = dict(
+            title="Prominence 閥值",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            zeroline=False,
+        )
+
+    fig.update_layout(
+        title=f"{strategy_name} 每日 SMAA / 閥值",
+        template=template,
+        height=360,
+        hovermode="x unified",
+        paper_bgcolor=paper_bg,
+        plot_bgcolor=plot_bg,
+        font=dict(color=font_color, size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=50, r=50, t=40, b=30),
+        **layout_kwargs,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor=grid_color)
+    fig.update_yaxes(title="SMAA", showgrid=True, gridcolor=grid_color)
+    return fig
+
 def calculate_equity_curve(open_px, w, cap, atr_ratio):
     """計算權益曲線"""
     try:
@@ -794,6 +1267,7 @@ def _pack_result_for_store(result: dict) -> dict:
         'daily_state', 'trade_ledger',
         'daily_state_std', 'trade_ledger_std',
         'weight_curve',
+        'indicator_daily',
         # ➊ 新增：保存未套閥門 baseline
         'daily_state_base', 'trade_ledger_base', 'weight_curve_base',
         # ➋ 新增：保存 valve 版本
@@ -1757,7 +2231,7 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             calc_keys = [
                 'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
                 'buy_shift', 'exit_shift', 'vol_window', 'signal_cooldown_days', 'quantile_win',
-                'volume_target_pass_rate', 'volume_target_lookback'
+                'signal_filter_mode', 'volume_target_pass_rate', 'volume_target_lookback'
             ]
             ssma_params = {k: v for k, v in strat_params.items() if k in calc_keys}
             backtest_params = ssma_params.copy()
@@ -1768,6 +2242,19 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             if df_ind.empty:
                 continue
             result = backtest_unified(df_ind, strat_type, backtest_params, buy_dates, sell_dates, discount=discount, trade_cooldown_bars=cooldown, bad_holding=bad_holding)
+            indicator_daily_df = _build_indicator_daily_frame(
+                df_ind,
+                strat_type,
+                strat_params,
+                buy_dates=buy_dates,
+                sell_dates=sell_dates,
+            )
+            if indicator_daily_df is not None and not indicator_daily_df.empty:
+                result["indicator_daily"] = indicator_daily_df
+            result["latest_t_signal"] = _extract_latest_t_signal(
+                strategy_type=strat_type,
+                indicator_daily=indicator_daily_df,
+            )
 
             # === 在 ssma_turn 也套用風險閥門（和 Ensemble 一致的後置覆寫） ===
             if global_apply:
@@ -2237,7 +2724,11 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                     'daily_state': pack_df(backtest_result.daily_state),
                     'trade_ledger': pack_df(backtest_result.ledger),
                     'daily_state_std': pack_df(backtest_result.daily_state),
-                    'trade_ledger_std': pack_df(backtest_result.ledger)
+                    'trade_ledger_std': pack_df(backtest_result.ledger),
+                    'latest_t_signal': _extract_latest_t_signal(
+                        strategy_type='ensemble',
+                        daily_state=backtest_result.daily_state,
+                    ),
                 }
 
                 # 🔥 恢復 valve 資訊
@@ -2264,7 +2755,8 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                     'trades_df': pd.DataFrame(),
                     'signals_df': pd.DataFrame(),
                     'metrics': {'total_return': 0.0, 'annual_return': 0.0, 'max_drawdown': 0.0, 'sharpe_ratio': 0.0, 'calmar_ratio': 0.0, 'num_trades': 0},
-                    'equity_curve': pd.Series(1.0, index=df_raw.index)
+                    'equity_curve': pd.Series(1.0, index=df_raw.index),
+                    'latest_t_signal': {'signal': 'HOLD', 'data_date': '', 'reason': 'ensemble_error'},
                 }
 
             # === 修復 3：添加調試日誌，核對子策略集合是否一致 ===
@@ -2293,6 +2785,13 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             if df_ind.empty:
                 continue
             result = backtest_unified(df_ind, strat_type, strat_params, discount=discount, trade_cooldown_bars=cooldown, bad_holding=bad_holding)
+            indicator_daily_df = _build_indicator_daily_frame(df_ind, strat_type, strat_params)
+            if indicator_daily_df is not None and not indicator_daily_df.empty:
+                result["indicator_daily"] = indicator_daily_df
+            result["latest_t_signal"] = _extract_latest_t_signal(
+                strategy_type=strat_type,
+                indicator_daily=indicator_daily_df,
+            )
 
             # 為其他策略類型添加 valve 標記
             if global_apply:
@@ -2307,6 +2806,7 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                     "cap": "N/A",
                     "atr_ratio": "N/A"
                 }
+        result["trade_cooldown_bars_used"] = int(cooldown or 0)
         # 統一使用 orient="split" 打包，避免重複序列化
         # 注意：Ensemble 策略已經在 pack_df/pack_series 中處理過，這裡只處理單策略
         if strat_type != 'ensemble':
@@ -2622,26 +3122,16 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
     Input('backtest-store', 'data'),
     Input('main-tabs', 'value'),
     Input('theme-store', 'data'),
-    Input('smart-leverage-switch', 'value')  # 🔥 新增 Smart Leverage 開關
+    Input('smart-leverage-switch', 'value'),  # 🔥 新增 Smart Leverage 開關
+    Input('hide-strategy-presets', 'value'),
+    Input('ticker-dropdown', 'value'),
 )
-def update_tab(data, tab, theme, smart_leverage_on):
+def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, ticker_for_daily):
     # 確保 pandas 可用
     import pandas as pd
 
     # === 調試日誌（僅在 DEBUG 級別時顯示）===
     logger.debug(f"update_tab 被調用 - tab: {tab}")
-
-    if not data:
-        logger.warning("沒有回測數據，顯示提示訊息")
-        return html.Div("請先執行回測")
-
-    # data 現在已經是 dict，不需要 json.loads
-    results = data['results']
-    df_raw = df_from_pack(data['df_raw'])  # 使用 df_from_pack 統一解包
-    ticker = data['ticker']
-    strategy_names = list(results.keys())
-
-    logger.debug(f"數據解析完成 - 策略數: {len(strategy_names)}, ticker: {ticker}, 數據行數: {len(df_raw) if df_raw is not None else 0}")
     # === 根據主題決定顏色變數 ===
     if theme == 'theme-light':
         # 淺色模式配色
@@ -2701,6 +3191,144 @@ def update_tab(data, tab, theme, smart_leverage_on):
         legend_bgcolor = 'rgba(30,30,30,0.8)'
         legend_bordercolor = '#fff'
         legend_font_color = '#fff'
+
+    if tab == "daily_signal":
+        daily_ticker = ticker_for_daily
+        if not daily_ticker and isinstance(data, dict):
+            daily_ticker = data.get("ticker")
+        if not daily_ticker:
+            daily_ticker = default_tickers[0]
+
+        context = build_daily_signal_context(
+            ticker=daily_ticker,
+            hidden_strategy_presets=hidden_strategy_presets,
+        )
+        req_df = context.requirements_df.copy()
+        display_cols = [
+            "strategy_name",
+            "strategy_type",
+            "symbol",
+            "field",
+            "min_bars",
+            "available_bars",
+            "ready",
+            "notes",
+        ]
+        for col in display_cols:
+            if col not in req_df.columns:
+                req_df[col] = ""
+        req_df = req_df[display_cols]
+        req_df["ready"] = req_df["ready"].apply(lambda x: "可用" if bool(x) else "不足")
+
+        req_col_name = {
+            "strategy_name": "策略名稱",
+            "strategy_type": "策略類型",
+            "symbol": "代號",
+            "field": "欄位",
+            "min_bars": "最少資料根數",
+            "available_bars": "目前可用根數",
+            "ready": "狀態",
+            "notes": "備註",
+        }
+
+        requirements_table = dash_table.DataTable(
+            columns=[{"name": req_col_name.get(c, c), "id": c} for c in req_df.columns],
+            data=req_df.to_dict("records"),
+            style_table={"overflowX": "auto", "backgroundColor": bg_color},
+            style_header={
+                "backgroundColor": table_header_bg,
+                "color": table_text,
+                "border": f"1px solid {table_border}",
+                "fontWeight": "bold",
+            },
+            style_cell={
+                "backgroundColor": table_cell_bg,
+                "color": table_text,
+                "textAlign": "center",
+                "border": f"1px solid {table_border}",
+                "padding": "6px",
+            },
+            style_data_conditional=[
+                {"if": {"filter_query": "{ready} = 不足"}, "color": "#ff6b6b", "fontWeight": "bold"}
+            ],
+            page_size=15,
+            id="daily-requirements-table",
+        )
+
+        estimate_inputs = []
+        for item in context.input_schema:
+            ready = bool(item.get("ready"))
+            latest_value = item.get("latest_value")
+            required_by = ", ".join(item.get("required_by", []))
+            estimate_inputs.append(
+                html.Div(
+                    [
+                        html.Div(
+                            f"{item['symbol']} {item['field']}（最少 {item['min_bars']} 根，目前 {item['available_bars']} 根）",
+                            style={
+                                "fontSize": "12px",
+                                "fontWeight": "bold",
+                                "color": "#28a745" if ready else "#ff6b6b",
+                            },
+                        ),
+                        dcc.Input(
+                            id={"type": "daily-estimate-input", "key": item["key"]},
+                            type="number",
+                            value=latest_value,
+                            debounce=True,
+                            style={"width": "180px", "marginTop": "4px"},
+                        ),
+                        html.Div(
+                            f"使用策略：{required_by}",
+                            style={"fontSize": "11px", "color": "#888", "marginTop": "2px"},
+                        ),
+                    ],
+                    style={
+                        "display": "inline-block",
+                        "width": "320px",
+                        "marginRight": "12px",
+                        "marginBottom": "10px",
+                        "verticalAlign": "top",
+                    },
+                )
+            )
+
+        return html.Div(
+            [
+                html.H4("📡 每日訊號戰情室（param_presets 真實/實驗）"),
+                html.Div(
+                    f"計算日期（台北時區）：{context.run_date.strftime('%Y-%m-%d')} | 標的：{daily_ticker}",
+                    style={"color": "#888", "marginBottom": "10px"},
+                ),
+                html.H5("策略需求矩陣"),
+                requirements_table,
+                html.Hr(),
+                html.H5("估算輸入（實驗模式）"),
+                html.Div(estimate_inputs if estimate_inputs else "目前沒有需要輸入的估算欄位。"),
+                html.Button(
+                    "🚀 計算今日訊號（真實 + 實驗）",
+                    id="btn-run-prediction",
+                    n_clicks=0,
+                    className="btn btn-danger",
+                    style={"marginTop": "8px", "marginBottom": "12px"},
+                ),
+                html.Div(id="prediction-status-msg"),
+                html.Div(id="daily-signal-results", style={"marginTop": "12px"}),
+            ],
+            style={"padding": "20px"},
+        )
+
+    if not data:
+        logger.warning("沒有回測數據，顯示提示訊息")
+        return html.Div("請先執行回測")
+
+    # data 現在已經是 dict，不需要 json.loads
+    results = data['results']
+    df_raw = df_from_pack(data['df_raw'])  # 使用 df_from_pack 統一解包
+    ticker = data['ticker']
+    strategy_names = list(results.keys())
+
+    logger.debug(f"數據解析完成 - 策略數: {len(strategy_names)}, ticker: {ticker}, 數據行數: {len(df_raw) if df_raw is not None else 0}")
 
     if tab == "backtest":
         # 創建策略回測的子頁籤
@@ -2988,12 +3616,29 @@ def update_tab(data, tab, theme, smart_leverage_on):
 
             metrics = result.get('metrics', {})
             tooltip = f"{strategy} 策略説明"
-            param_display = {k: v for k, v in param_presets[strategy].items() if k != "strategy_type"}
-            param_str = ", ".join(f"{k}: {v}" for k, v in param_display.items())
+            strategy_cfg = param_presets.get(strategy, {})
+            strategy_type = str(strategy_cfg.get("strategy_type", "")).strip().lower()
+            param_display = {k: v for k, v in strategy_cfg.items() if k != "strategy_type"}
+
+            def _compact_param_value(v: Any) -> str:
+                if isinstance(v, dict):
+                    return "{" + ", ".join(f"{kk}={_compact_param_value(vv)}" for kk, vv in v.items()) + "}"
+                if isinstance(v, list):
+                    return "[" + ", ".join(_compact_param_value(x) for x in v) + "]"
+                if isinstance(v, float):
+                    if pd.isna(v) or np.isinf(v):
+                        return "N/A"
+                    return f"{v:.6g}"
+                return str(v)
+
+            param_str = " | ".join(f"{k}={_compact_param_value(v)}" for k, v in param_display.items())
+            param_line_text = f"參數設定: {param_str}"
             avg_holding = calculate_holding_periods(trade_df)
             metrics['avg_holding_period'] = avg_holding
             daily_state_hint = daily_state_std if (daily_state_std is not None and not daily_state_std.empty) else daily_state
             _ensure_exposure_metrics(metrics, result, daily_state_hint=daily_state_hint)
+            nav_rel_ratio = _calc_nav_relative_ratio(ds_for_calc, df_raw)
+            metrics["nav_relative_ratio"] = float(nav_rel_ratio) if pd.notna(nav_rel_ratio) else np.nan
 
             label_map = {
                 "total_return": "總回報率",
@@ -3010,6 +3655,7 @@ def update_tab(data, tab, theme, smart_leverage_on):
                 "turnover_py": "年化換手率",
                 "num_trades": "交易次數",
                 "avg_holding_period": "平均持倉天數",
+                "nav_relative_ratio": "相對淨值比",
                 "annualized_volatility": "年化波動率",
                 "max_consecutive_wins": "最大連續盈利",
                 "max_consecutive_losses": "最大連續虧損",
@@ -3030,9 +3676,37 @@ def update_tab(data, tab, theme, smart_leverage_on):
                 except (TypeError, ValueError):
                     return str(val)
 
+            metric_display_order = [
+                "total_return",
+                "annual_return",
+                "max_drawdown",
+                "calmar_ratio",
+                "sharpe_ratio",
+                "sortino_ratio",
+                "annualized_volatility",
+                "win_rate",
+                "profit_factor",
+                "payoff_ratio",
+                "num_trades",
+                "avg_holding_period",
+                "time_in_market",
+                "turnover_py",
+                "max_drawdown_duration",
+                "nav_relative_ratio",
+                "max_consecutive_wins",
+                "max_consecutive_losses",
+                "avg_win",
+                "avg_loss",
+            ]
+            ordered_metric_keys = [k for k in metric_display_order if k in metrics]
+            ordered_metric_keys.extend(sorted([k for k in metrics.keys() if k not in ordered_metric_keys]))
+
             metric_cards = []
-            for k, v in metrics.items():
-                if k in ["total_return", "annual_return", "win_rate", "max_drawdown", "annualized_volatility", "avg_win", "avg_loss", "time_in_market", "turnover_py"]:
+            for k in ordered_metric_keys:
+                v = metrics.get(k)
+                if k == "nav_relative_ratio":
+                    txt = safe_fmt(v, is_pct=False, suffix="x")
+                elif k in ["total_return", "annual_return", "win_rate", "max_drawdown", "annualized_volatility", "avg_win", "avg_loss", "time_in_market", "turnover_py"]:
                     txt = safe_fmt(v, is_pct=True)
                 elif k in ["calmar_ratio", "sharpe_ratio", "sortino_ratio", "payoff_ratio", "profit_factor"]:
                     txt = safe_fmt(v, is_pct=False)
@@ -3080,6 +3754,7 @@ def update_tab(data, tab, theme, smart_leverage_on):
             vote_threshold = None
             vote_diagnostics = _new_vote_diagnostics()
             vote_warning_component = html.Div()
+            indicator_daily = df_from_pack(result.get("indicator_daily"))
 
             # === 🎯 建立統一圖表（三圖同步） ===
             if daily_state_display is not None and not daily_state_display.empty and {'equity','cash'}.issubset(daily_state_display.columns):
@@ -3106,6 +3781,7 @@ def update_tab(data, tab, theme, smart_leverage_on):
                     theme='dark' if theme == 'theme-dark' else 'light',
                     votes_series=vote_series,
                     votes_threshold=vote_threshold,
+                    indicator_df=indicator_daily,
                 )
 
                 # 原始的分離圖表（已註解）
@@ -3233,15 +3909,122 @@ def update_tab(data, tab, theme, smart_leverage_on):
                 unified_fig_height = 900
             unified_graph_style = {'height': f'{int(unified_fig_height)}px'}
 
+            cooldown_used = int(result.get("trade_cooldown_bars_used", 0) or 0)
+            latest_t_signal = _extract_latest_t_signal(
+                strategy_type=strategy_type,
+                indicator_daily=indicator_daily,
+                daily_state=daily_state_display,
+                trade_df=trade_df,
+                trade_cooldown_bars=cooldown_used,
+            )
+
+            sig_code = str(latest_t_signal.get("signal", "HOLD")).upper()
+            sig_date = str(latest_t_signal.get("data_date") or "N/A")
+            sig_reason = str(latest_t_signal.get("reason") or "")
+            last_sig_code = str(latest_t_signal.get("last_signal", "HOLD")).upper()
+            last_sig_date = str(latest_t_signal.get("last_signal_date") or "N/A")
+            sig_text_map = {"BUY": "買入", "SELL": "賣出", "HOLD": "觀望"}
+            sig_color_map = {"BUY": "#2f9e44", "SELL": "#e03131", "HOLD": "#868e96"}
+            sig_label = sig_text_map.get(sig_code, sig_code)
+            sig_color = sig_color_map.get(sig_code, "#868e96")
+            last_sig_label = sig_text_map.get(last_sig_code, last_sig_code)
+            last_sig_color = sig_color_map.get(last_sig_code, "#868e96")
+            last_sig_reason = str(latest_t_signal.get("last_signal_reason") or "")
+
+            actionable_signal_card = dbc.Col(
+                [
+                    dbc.Card(
+                        [
+                            dbc.CardBody(
+                                [
+                                    html.Div("最新訊號", className="card-title-label", style={"color": card_text}),
+                                    html.Div([
+                                        html.Span(
+                                            sig_label,
+                                            style={
+                                                "fontWeight": "bold",
+                                                "fontSize": "20px",
+                                                "color": sig_color,
+                                                "lineHeight": "1.2",
+                                            }
+                                        ),
+                                        html.Span(
+                                            f"({sig_date})",
+                                            style={
+                                                "fontSize": "12px",
+                                                "color": card_text
+                                            }
+                                        ),
+                                    ]),
+
+                                    html.Div(sig_reason if sig_reason else "條件：N/A", style={"fontSize": "11px", "color": "#888"}),
+                                ]
+                            )
+                        ],
+                        style={
+                            "background": card_bg,
+                            "border": f"1px solid {card_border}",
+                            "borderLeft": f"6px solid {sig_color}",
+                            "borderRadius": "8px",
+                            "margin-bottom": "6px",
+                        },
+                    )
+                ],
+                xs=12, sm=6, md=4, lg=2, xl=2,
+                style={"minWidth": "100px", "margin-bottom": "6px", "maxWidth": "12.5%"},
+            )
+
+            latest_emitted_signal_card = dbc.Col(
+                [
+                    dbc.Card(
+                        [
+                            dbc.CardBody(
+                                [
+                                    html.Div("上次發出訊號", className="card-title-label", style={"color": card_text}),
+                                    html.Div([
+                                        html.Span(
+                                        last_sig_label,
+                                        style={"fontWeight": "bold", "fontSize": "20px", "color": last_sig_color, "lineHeight": "1.2"},
+                                    ),
+                                        html.Span(f"({last_sig_date})", style={"fontSize": "12px", "color": card_text})
+                                    ]),
+                                    html.Div(last_sig_reason if last_sig_reason else "條件：N/A", style={"fontSize": "11px", "color": "#888"}),
+                                ]
+                            )
+                        ],
+                        style={
+                            "background": card_bg,
+                            "border": f"1px solid {card_border}",
+                            "borderLeft": f"6px solid {last_sig_color}",
+                            "borderRadius": "8px",
+                            "margin-bottom": "6px",
+                        },
+                    )
+                ],
+                xs=12, sm=6, md=4, lg=2, xl=2,
+                style={"minWidth": "100px", "margin-bottom": "6px", "maxWidth": "12.5%"},
+            )
+
+            summary_cards = [actionable_signal_card, latest_emitted_signal_card] + metric_cards
+
             strategy_content = html.Div([
                 html.H4([
                     f"回測策略: {strategy} ",
                     html.Span("ⓘ", title=tooltip, style={"cursor": "help", "color": "#888"}),
                     valve_badge
                 ]),
-                html.Div(f"參數設定: {param_str}"),
-                html.Br(),
-                dbc.Row(metric_cards, style={"flex-wrap": "wrap"}, className='metrics-cards-row'),
+                html.Div(
+                    param_line_text,
+                    title=param_line_text,
+                    style={
+                        "whiteSpace": "nowrap",
+                        "overflow": "hidden",
+                        "textOverflow": "ellipsis",
+                        "maxWidth": "100%",
+                        "fontSize": "13px",
+                    },
+                ),
+                dbc.Row(summary_cards, style={"flex-wrap": "wrap"}, className='metrics-cards-row'),
                 html.Br(),
                 # 🎯 統一圖表（三圖同步縮放）
                 dcc.Graph(
@@ -3405,11 +4188,22 @@ def update_tab(data, tab, theme, smart_leverage_on):
             detailed_stats = calculate_strategy_detailed_stats(trade_df, df_raw)
 
             metrics = result['metrics']
+            ds_for_nav = df_from_pack(
+                result.get("daily_state_valve")
+                or result.get("daily_state_std")
+                or result.get("daily_state")
+                or result.get("daily_state_base")
+            )
+            nav_rel_ratio = _calc_nav_relative_ratio(ds_for_nav, df_raw)
+            metrics["nav_relative_ratio"] = float(nav_rel_ratio) if pd.notna(nav_rel_ratio) else np.nan
 
             # 安全取值函數：處理 None -> 0 的轉換，避免格式化錯誤
             def safe_get(key, default=0.0):
                 v = metrics.get(key)
                 return v if v is not None else default
+
+            nav_rel_val = safe_get("nav_relative_ratio", np.nan)
+            nav_rel_text = f"{nav_rel_val:.2f}x" if pd.notna(nav_rel_val) else "N/A"
 
             comparison_data.append({
                 '策略': strategy,
@@ -3417,6 +4211,7 @@ def update_tab(data, tab, theme, smart_leverage_on):
                 '年化回報率': f"{safe_get('annual_return'):.2%}",
                 '最大回撤': f"{safe_get('max_drawdown'):.2%}",
                 '卡瑪比率': f"{safe_get('calmar_ratio'):.2f}",
+                'NAV相對淨值比': nav_rel_text,
                 '交易次數': int(safe_get('num_trades', 0)),
                 '勝率': f"{safe_get('win_rate'):.2%}",
                 '盈虧比': f"{safe_get('payoff_ratio'):.2f}",
@@ -3612,106 +4407,6 @@ def update_tab(data, tab, theme, smart_leverage_on):
         ])
 
         return enhanced_controls
-    elif tab == "daily_signal":
-            # === 每日訊號戰情室 (Dash 版實作) ===
-            import os
-            from datetime import datetime
-
-            history_file = 'analysis/signal_history.csv'
-
-            # 定義執行按鈕
-            run_btn_layout = html.Div([
-                html.Button("🚀 執行今日預測 (呼叫 predict_tomorrow.py)", id="btn-run-prediction", n_clicks=0,
-                        className="btn btn-danger", style={"marginBottom": "20px"}),
-                html.Div(id="prediction-status-msg") # 用來顯示執行結果
-            ])
-
-            # 檢查檔案是否存在
-            if not os.path.exists(history_file):
-                return html.Div([
-                    html.H4("🔮 SSS096 每日營運戰情室"),
-                    html.Div("尚無歷史紀錄，請點擊下方按鈕執行初次預測。", style={"color": "orange"}),
-                    run_btn_layout
-                ], style={"padding": "20px"})
-
-            # 讀取數據
-            try:
-                df_hist = pd.read_csv(history_file)
-                if df_hist.empty:
-                    return html.Div(["紀錄檔為空，請重新執行預測。", run_btn_layout])
-
-                # 整理數據
-                df_hist['date'] = pd.to_datetime(df_hist['date'])
-                df_hist = df_hist.sort_values('date', ascending=False)
-                latest_date_dt = df_hist['date'].iloc[0]
-                latest_date_str = latest_date_dt.strftime('%Y-%m-%d')
-
-                # 篩選今日資料
-                df_today = df_hist[df_hist['date'] == latest_date_dt].copy()
-
-                # 計算統計
-                total_votes = len(df_today)
-                long_votes = len(df_today[df_today['signal'] == 'LONG'])
-                cash_votes = total_votes - long_votes
-
-                # 判斷建議
-                decision_text = "🟢 進場做多 (LONG)" if long_votes > cash_votes else "⚪ 空手觀望 (CASH)"
-                decision_color = "#28a745" if long_votes > cash_votes else "#6c757d"
-
-                # 製作 KPI 卡片
-                def card(title, val, color):
-                    return dbc.Card([
-                        dbc.CardBody([
-                            html.H5(title, className="card-title", style={"color": card_text}),
-                            html.H2(val, style={"color": color, "fontWeight": "bold"})
-                        ])
-                    ], style={"backgroundColor": card_bg, "border": f"1px solid {color}"})
-
-                kpi_row = dbc.Row([
-                    dbc.Col(card("多單票數", f"{long_votes} / {total_votes}", "#28a745"), width=4),
-                    dbc.Col(card("空手票數", f"{cash_votes} / {total_votes}", "#ffc107"), width=4),
-                    dbc.Col(card("最終建議", decision_text, decision_color), width=4),
-                ], className="mb-4")
-
-                # 製作詳細表格
-                df_display = df_today[['strategy_name', 'signal', 'price']].copy()
-                table = dash_table.DataTable(
-                    columns=[{"name": i, "id": i} for i in df_display.columns],
-                    data=df_display.to_dict('records'),
-                    style_table={'backgroundColor': bg_color},
-                    style_header={'backgroundColor': table_header_bg, 'color': table_text, 'border': f'1px solid {table_border}'},
-                    style_cell={'backgroundColor': table_cell_bg, 'color': table_text, 'textAlign': 'center', 'border': f'1px solid {table_border}'},
-                )
-
-                # 製作歷史趨勢圖
-                daily_trend = df_hist.groupby('date')['signal'].apply(lambda x: (x=='LONG').sum()).reset_index()
-                daily_trend.columns = ['date', 'long_votes']
-
-                fig_trend = go.Figure()
-                fig_trend.add_trace(go.Bar(
-                    x=daily_trend['date'], y=daily_trend['long_votes'],
-                    name='多單票數', marker_color='#28a745'
-                ))
-                fig_trend.update_layout(
-                    title="每日多單票數變化",
-                    template=plotly_template,
-                    font_color=font_color,
-                    plot_bgcolor=bg_color,
-                    paper_bgcolor=bg_color
-                )
-
-                return html.Div([
-                    html.H3(f"📅 最新訊號日期：{latest_date_str}"),
-                    run_btn_layout,
-                    kpi_row,
-                    html.H4("詳細投票明細"),
-                    table,
-                    html.Hr(),
-                    dcc.Graph(figure=fig_trend)
-                ], style={"padding": "20px"})
-
-            except Exception as e:
-                return html.Div([f"讀取資料錯誤: {str(e)}", run_btn_layout])
 # --------- 版本沿革模態框控制和主題切換 ---------
 @app.callback(
     Output("history-modal", "is_open"),
@@ -5853,82 +6548,211 @@ def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value,
     status_msg = f"✅ 成功生成：掃描 cap×ATR 比值 {succeeded}/{tried} 組。顏色=右尾調整幅度（紅=削減，藍=放大），大小=風險觸發天數。目前全局設定：cap={cap_now:.2f}, atr={atr_now:.2f}。資料來源：{data_source}"
     return fig, status_msg
 
-# --------- 2025/12/23 09:53 新增:每日訊號-執行預測腳本 ---------
-def run_prediction_script(
-    n_clicks,
-    ticker: str = "00631L.TW",
-    warehouse_file: str = "strategy_warehouse.json",
-):
-    """
-    Execute predict_tomorrow.py safely and return status + refresh signal.
-    """
-    if not n_clicks:
-        return "", no_update
-
-    cmd = [sys.executable, "predict_tomorrow.py"]
-    if ticker:
-        cmd.extend(["--ticker", str(ticker)])
-    if warehouse_file:
-        cmd.extend(["--warehouse-file", str(warehouse_file)])
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as exc:
-        timeout_val = int(exc.timeout) if exc.timeout else 120
-        return (
-            html.Div(
-                f"❌ Prediction timed out after {timeout_val}s.",
-                style={"color": "#dc3545", "marginTop": "10px"},
-            ),
-            no_update,
-        )
-    except Exception as exc:
-        return (
-            html.Div(
-                f"❌ 系統錯誤: {exc}",
-                style={"color": "#dc3545", "marginTop": "10px"},
-            ),
-            no_update,
-        )
-
-    if result.returncode == 0:
-        return (
-            html.Div(
-                "✅ 計算完成！請切換頁籤或重新整理以查看最新結果。",
-                style={"color": "#28a745", "marginTop": "10px", "fontWeight": "bold"},
-            ),
-            datetime.now().isoformat(),
-        )
-
-    err_text = (result.stderr or result.stdout or "Unknown error").strip()
-    return (
-        html.Div(
-            [
-                html.Div("❌ 執行失敗", style={"fontWeight": "bold"}),
-                html.Pre(err_text, style={"fontSize": "12px", "whiteSpace": "pre-wrap"}),
-            ],
-            style={"color": "#dc3545", "marginTop": "10px"},
-        ),
-        no_update,
-    )
-
-
+# --------- 每日訊號：param_presets real/experiment 引擎 ---------
 @app.callback(
     Output("prediction-status-msg", "children"),
+    Output("daily-signal-results", "children"),
     Input("btn-run-prediction", "n_clicks"),
-    prevent_initial_call=True
+    State("ticker-dropdown", "value"),
+    State("hide-strategy-presets", "value"),
+    State({"type": "daily-estimate-input", "key": ALL}, "id"),
+    State({"type": "daily-estimate-input", "key": ALL}, "value"),
+    prevent_initial_call=True,
 )
-def run_prediction_script_callback(n_clicks):
-    msg, _refresh = run_prediction_script(n_clicks)
-    return msg
+def run_prediction_script_callback(
+    n_clicks,
+    ticker,
+    hidden_strategy_presets,
+    estimate_ids,
+    estimate_values,
+):
+    if not n_clicks:
+        return no_update, no_update
+
+    ticker = ticker or default_tickers[0]
+    estimate_raw = {}
+    for id_obj, value in zip(estimate_ids or [], estimate_values or []):
+        if isinstance(id_obj, dict):
+            key = id_obj.get("key")
+            if key:
+                estimate_raw[str(key)] = value
+
+    try:
+        result = run_daily_param_signals(
+            ticker=ticker,
+            hidden_strategy_presets=hidden_strategy_presets,
+            estimates=estimate_raw,
+            persist_experiment=False,
+        )
+    except Exception as exc:
+        msg = html.Div(
+            f"❌ 每日訊號計算失敗: {exc}",
+            style={"color": "#dc3545", "fontWeight": "bold"},
+        )
+        return msg, html.Div()
+
+    context = result["context"]
+    real_df = result["real_df"].copy()
+    exp_df = result["experiment_df"].copy()
+    changed_df = result["changed_df"].copy()
+    missing = result["missing_inputs"]
+    signal_map = {"BUY": "買入", "SELL": "賣出", "HOLD": "觀望"}
+    mode_map = {"real": "真實模式", "experiment": "實驗模式"}
+    strategy_type_map = {
+        "single": "單因子",
+        "rma": "RMA",
+        "ssma_turn": "SSMA 轉折",
+        "ensemble": "集成",
+    }
+
+    def _display_df(df_in: pd.DataFrame, mode_name: str) -> pd.DataFrame:
+        cols = [
+            "strategy_name",
+            "strategy_type",
+            "mode",
+            "signal",
+            "price",
+            "volume",
+            "triggered",
+            "impact_compare",
+        ]
+        df = df_in.copy()
+        if "mode" not in df.columns:
+            df["mode"] = mode_name
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[cols]
+        df["mode"] = df["mode"].astype(str).str.lower().map(mode_map).fillna(df["mode"])
+        df["signal"] = df["signal"].astype(str).str.upper().map(signal_map).fillna(df["signal"])
+        df["strategy_type"] = (
+            df["strategy_type"].astype(str).str.lower().map(strategy_type_map).fillna(df["strategy_type"])
+        )
+        df["triggered"] = df["triggered"].apply(
+            lambda x: "是" if str(x).lower() in {"true", "1", "yes"} else ("否" if str(x).lower() in {"false", "0", "no"} else x)
+        )
+        df["impact_compare"] = (
+            df["impact_compare"]
+            .astype(str)
+            .replace(
+                {
+                    "UNCHANGED": "未變化",
+                    "REAL_BASELINE": "真實基準",
+                }
+            )
+        )
+        df["impact_compare"] = (
+            df["impact_compare"]
+            .str.replace("BUY", "買入", regex=False)
+            .str.replace("SELL", "賣出", regex=False)
+            .str.replace("HOLD", "觀望", regex=False)
+        )
+        df["price"] = pd.to_numeric(df["price"], errors="coerce").round(4)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").round(0)
+        df = df.fillna("")
+        return df
+
+    def _make_table(df: pd.DataFrame, table_id: str):
+        col_name_map = {
+            "strategy_name": "策略名稱",
+            "strategy_type": "策略類型",
+            "mode": "模式",
+            "signal": "訊號",
+            "price": "價格",
+            "volume": "成交量",
+            "triggered": "有觸發",
+            "impact_compare": "與真實模式比較",
+        }
+        return dash_table.DataTable(
+            id=table_id,
+            columns=[{"name": col_name_map.get(c, c), "id": c} for c in df.columns],
+            data=df.to_dict("records"),
+            style_table={"overflowX": "auto"},
+            style_header={
+                "backgroundColor": "#2d2d2d",
+                "color": "#e0e0e0",
+                "border": "1px solid #444",
+                "fontWeight": "bold",
+            },
+            style_cell={
+                "backgroundColor": "#1e1e1e",
+                "color": "#e0e0e0",
+                "textAlign": "center",
+                "border": "1px solid #444",
+                "padding": "6px",
+            },
+            style_data_conditional=[
+                {"if": {"filter_query": "{signal} = 買入"}, "color": "#48c774", "fontWeight": "bold"},
+                {"if": {"filter_query": "{signal} = 賣出"}, "color": "#ff6b6b", "fontWeight": "bold"},
+                {"if": {"filter_query": "{signal} = 觀望"}, "color": "#bfbfbf"},
+                {"if": {"filter_query": "{impact_compare} != 未變化"}, "backgroundColor": "#3a2d1a"},
+            ],
+            page_size=20,
+        )
+
+    real_disp = _display_df(real_df, "real")
+    exp_disp = _display_df(exp_df, "experiment")
+
+    changed_block = html.Div("無訊號變化。")
+    if not changed_df.empty:
+        changed_disp = changed_df.copy()
+        changed_disp = changed_disp.rename(
+            columns={
+                "strategy_name": "策略名稱",
+                "real_signal": "真實模式訊號",
+                "experiment_signal": "實驗模式訊號",
+            }
+        )
+        for c in ["真實模式訊號", "實驗模式訊號"]:
+            changed_disp[c] = changed_disp[c].astype(str).str.upper().map(signal_map).fillna(changed_disp[c])
+        changed_block = dash_table.DataTable(
+            columns=[{"name": c, "id": c} for c in changed_disp.columns],
+            data=changed_disp.to_dict("records"),
+            style_table={"overflowX": "auto"},
+            style_header={"backgroundColor": "#2d2d2d", "color": "#e0e0e0"},
+            style_cell={"backgroundColor": "#1e1e1e", "color": "#e0e0e0", "textAlign": "center"},
+        )
+
+    missing_block = html.Div()
+    if missing:
+        missing_labels = [f"{item['symbol']} {item['field']}" for item in missing]
+        missing_block = html.Div(
+            [
+                html.Div("實驗模式缺少必要估算欄位：", style={"fontWeight": "bold", "color": "#ff6b6b"}),
+                html.Ul([html.Li(x) for x in missing_labels]),
+            ],
+            style={"marginTop": "8px"},
+        )
+
+    if missing:
+        status_msg = html.Div(
+            [
+                html.Div(
+                    f"⚠️ 真實模式已完成；實驗模式未執行。計算日期：{context.run_date.strftime('%Y-%m-%d')}",
+                    style={"color": "#ffc107", "fontWeight": "bold"},
+                ),
+                missing_block,
+            ]
+        )
+    else:
+        status_msg = html.Div(
+            f"✅ 計算完成（{context.run_date.strftime('%Y-%m-%d')}，不落檔）。",
+            style={"color": "#28a745", "fontWeight": "bold"},
+        )
+
+    result_layout = html.Div(
+        [
+            html.H5("真實模式"),
+            _make_table(real_disp, "daily-real-table"),
+            html.Hr(),
+            html.H5("實驗模式"),
+            _make_table(exp_disp, "daily-exp-table"),
+            html.Hr(),
+            html.H5("訊號改變清單"),
+            changed_block,
+        ]
+    )
+    return status_msg, result_layout
 
 
 if __name__ == '__main__':

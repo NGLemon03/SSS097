@@ -14,6 +14,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class TWSECrawler:
+    MI_INDEX_MIN_DATE = datetime(2004, 2, 11)
+    PROGRESS_KEY_FMTQIK = "FMTQIK"
+    PROGRESS_KEY_MI_INDEX = "MI_INDEX"
+
     def __init__(
         self,
         db_path=None,
@@ -85,6 +89,13 @@ class TWSECrawler:
                             raw_json TEXT
                         )"""
             )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS crawler_progress (
+                            crawler TEXT PRIMARY KEY,
+                            last_download_date TEXT,
+                            updated_at TEXT
+                        )"""
+            )
             conn.commit()
 
     @staticmethod
@@ -96,6 +107,43 @@ class TWSECrawler:
         if not stat_text:
             return False
         return any(k in stat_text for k in ("沒有符合條件", "查無資料", "無資料"))
+
+    @staticmethod
+    def _parse_ymd(date_text):
+        try:
+            return datetime.strptime(date_text, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return None
+
+    def _get_last_download_date(self, cursor, crawler_key):
+        cursor.execute("SELECT last_download_date FROM crawler_progress WHERE crawler=?", (crawler_key,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        return self._parse_ymd(row[0])
+
+    def _set_last_download_date(self, cursor, crawler_key, date_obj):
+        if date_obj is None:
+            return
+        date_str = date_obj.strftime("%Y-%m-%d")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            """INSERT INTO crawler_progress (crawler, last_download_date, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(crawler) DO UPDATE SET
+                 last_download_date=excluded.last_download_date,
+                 updated_at=excluded.updated_at""",
+            (crawler_key, date_str, now_str),
+        )
+
+    def _get_max_table_date(self, cursor, table_name):
+        if table_name not in {"fmtqik", "mi_index"}:
+            return None
+        cursor.execute(f"SELECT MAX(date) FROM {table_name}")
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        return self._parse_ymd(row[0])
 
     def _request_json(self, url, tag):
         """有界重試的 HTTP JSON 請求，避免無限重試卡住。"""
@@ -125,10 +173,20 @@ class TWSECrawler:
     def fetch_fmtqik(self, start_year=2000):
         """爬取每月的大盤總結資料 (FMTQIK)"""
         today = datetime.now()
-        current_date = datetime(start_year, 1, 1)
+        requested_start = datetime(start_year, 1, 1)
 
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
+            current_date = requested_start
+            last_download_date = self._get_last_download_date(c, self.PROGRESS_KEY_FMTQIK)
+            if last_download_date is None:
+                last_download_date = self._get_max_table_date(c, "fmtqik")
+                if last_download_date is not None:
+                    self._set_last_download_date(c, self.PROGRESS_KEY_FMTQIK, last_download_date)
+                    conn.commit()
+            if last_download_date and last_download_date > requested_start:
+                current_date = last_download_date
+                LOGGER.info("[FMTQIK] 從上次最後下載日期續抓: %s", last_download_date.strftime("%Y-%m-%d"))
 
             while current_date <= today:
                 month_str = current_date.strftime("%Y%m")
@@ -153,6 +211,7 @@ class TWSECrawler:
                 if data is not None:
                     stat = str(data.get("stat", "")).strip()
                     if stat == "OK":
+                        latest_row_date = None
                         for row in data.get("data", []):
                             if len(row) < 6:
                                 LOGGER.warning("[FMTQIK] %s 存在異常資料列: %s", month_str, row)
@@ -169,6 +228,8 @@ class TWSECrawler:
                                     int(tw_date[2]),
                                 )
                                 gregorian_date = date_obj.strftime("%Y-%m-%d")
+                                if latest_row_date is None or date_obj > latest_row_date:
+                                    latest_row_date = date_obj
                             except Exception as parse_err:
                                 LOGGER.warning(
                                     "[FMTQIK] %s 日期解析失敗 (%s): %s", month_str, row[0], parse_err
@@ -187,6 +248,8 @@ class TWSECrawler:
                             "INSERT OR REPLACE INTO fmtqik_months (month, fetched_at) VALUES (?, ?)",
                             (month_str, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                         )
+                        progress_date = latest_row_date if latest_row_date is not None else current_date
+                        self._set_last_download_date(c, self.PROGRESS_KEY_FMTQIK, progress_date)
                         conn.commit()
                         fetch_ok = True
                     else:
@@ -201,10 +264,26 @@ class TWSECrawler:
     def fetch_mi_index(self, start_year=2000):
         """爬取每日詳細收盤行情與所有額外資訊 (MI_INDEX)"""
         today = datetime.now()
-        current_date = datetime(start_year, 1, 1)
+        requested_start = datetime(start_year, 1, 1)
+        current_date = max(requested_start, self.MI_INDEX_MIN_DATE)
+
+        if requested_start < self.MI_INDEX_MIN_DATE:
+            LOGGER.info(
+                "[MI_INDEX] 起始日期早於 TWSE 可查下限，調整為 %s",
+                self.MI_INDEX_MIN_DATE.strftime("%Y-%m-%d"),
+            )
 
         with sqlite3.connect(self.db_path) as conn:
             c = conn.cursor()
+            last_download_date = self._get_last_download_date(c, self.PROGRESS_KEY_MI_INDEX)
+            if last_download_date is None:
+                last_download_date = self._get_max_table_date(c, "mi_index")
+                if last_download_date is not None:
+                    self._set_last_download_date(c, self.PROGRESS_KEY_MI_INDEX, last_download_date)
+                    conn.commit()
+            if last_download_date and last_download_date > current_date:
+                current_date = last_download_date
+                LOGGER.info("[MI_INDEX] 從上次最後下載日期續抓: %s", last_download_date.strftime("%Y-%m-%d"))
 
             while current_date <= today:
                 # 六日不開盤，直接跳過減少不必要的請求
@@ -258,6 +337,7 @@ class TWSECrawler:
                        VALUES (?, ?, ?)""",
                     (date_str_db, has_data, raw_json_str),
                 )
+                self._set_last_download_date(c, self.PROGRESS_KEY_MI_INDEX, current_date)
                 conn.commit()
 
                 self.delay()

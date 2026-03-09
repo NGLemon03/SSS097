@@ -97,11 +97,13 @@ def create_unified_dashboard(
     theme: str = "dark",
     votes_series: Optional[pd.Series] = None,
     votes_threshold: Optional[float] = None,
+    indicator_df: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     """建立統一儀表板（X 軸同步）。"""
 
     labels = {
         "title_price": "股價與買賣點",
+        "title_indicator": "每日 SMAA 與閥值",
         "title_eq": "權益與現金",
         "title_weight": "持倉權重(%)",
         "title_lifo": "LIFO 交易報酬",
@@ -112,6 +114,11 @@ def create_unified_dashboard(
         "buy": "買點",
         "sell": "賣點",
         "forced_sell": "強制賣出",
+        "smaa": "SMAA",
+        "base": "基準線",
+        "buy_threshold": "買入閥值",
+        "sell_threshold": "賣出閥值",
+        "prom_threshold": "Prominence閥值",
         "equity": "權益",
         "cash": "現金",
         "weight": "持倉權重(%)",
@@ -125,6 +132,7 @@ def create_unified_dashboard(
         "roll30": "30日滾動超額",
         "roll60": "60日滾動超額",
         "axis_price": "價格",
+        "axis_indicator": "SMAA/閥值",
         "axis_asset": "資產",
         "axis_weight": "持倉權重(%)",
         "axis_ret": "報酬率",
@@ -153,67 +161,87 @@ def create_unified_dashboard(
         if not df_raw_aligned.empty:
             df_raw_aligned = df_raw_aligned.loc[df_raw_aligned.index >= ds.index.min()].copy()
 
+    indicator = indicator_df.copy() if indicator_df is not None else pd.DataFrame()
+    if not indicator.empty:
+        indicator.index = pd.to_datetime(indicator.index, errors="coerce")
+        indicator = indicator[indicator.index.notna()].sort_index()
+        if not ds.empty:
+            indicator = indicator.loc[indicator.index >= ds.index.min()].copy()
+        if not df_raw_aligned.empty:
+            indicator = indicator.loc[indicator.index >= df_raw_aligned.index.min()].copy()
+    has_indicator = (not indicator.empty) and ("smaa" in indicator.columns)
+
     close_col = _pick_col(df_raw_aligned, ["close", "Close", "收盤價"])
     has_votes = votes_series is not None and len(votes_series) > 0
 
+    row_price = 1
+    row_indicator = 2 if has_indicator else None
+    row_eq = 3 if has_indicator else 2
+    row_weight = row_eq + 1
+    row_lifo = row_weight + 1
     if has_votes:
-        # Row 1~7: price / eq / w / lifo / votes / dd-nav / rolling60
-        fig = make_subplots(
-            rows=7,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.02,
-            subplot_titles=(
-                f"{ticker} {labels['title_price']}",
-                labels["title_eq"],
-                labels["title_weight"],
-                labels["title_lifo"],
-                labels["title_votes"],
-                labels["title_dd_nav"],
-                labels["title_rolling"],
-            ),
-            row_heights=[0.23, 0.16, 0.12, 0.15, 0.09, 0.15, 0.10],
-            specs=[
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": True}],
-                [{"secondary_y": False}],
-            ],
-        )
-        row_votes, row_dd_nav, row_rolling = 5, 6, 7
+        row_votes = row_lifo + 1
+        row_dd_nav = row_votes + 1
+        row_rolling = row_dd_nav + 1
     else:
-        # Row 1~6: price / eq / w / lifo / dd-nav / rolling60
-        fig = make_subplots(
-            rows=6,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.02,
-            subplot_titles=(
-                f"{ticker} {labels['title_price']}",
-                labels["title_eq"],
-                labels["title_weight"],
-                labels["title_lifo"],
-                labels["title_dd_nav"],
-                labels["title_rolling"],
-            ),
-            row_heights=[0.27, 0.19, 0.14, 0.16, 0.15, 0.09],
-            specs=[
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": False}],
-                [{"secondary_y": True}],
-                [{"secondary_y": False}],
-            ],
-        )
-        row_votes, row_dd_nav, row_rolling = None, 5, 6
+        row_votes = None
+        row_dd_nav = row_lifo + 1
+        row_rolling = row_dd_nav + 1
+
+    total_rows = row_rolling
+    subplot_titles: list[str] = [f"{ticker} {labels['title_price']}"]
+    if has_indicator:
+        subplot_titles.append(labels["title_indicator"])
+    subplot_titles.extend(
+        [
+            labels["title_eq"],
+            labels["title_weight"],
+            labels["title_lifo"],
+        ]
+    )
+    if has_votes:
+        subplot_titles.append(labels["title_votes"])
+    subplot_titles.extend([labels["title_dd_nav"], labels["title_rolling"]])
+
+    if has_indicator and has_votes:
+        row_heights = [0.18, 0.14, 0.14, 0.11, 0.13, 0.08, 0.13, 0.09]
+    elif has_indicator and not has_votes:
+        row_heights = [0.20, 0.15, 0.16, 0.12, 0.15, 0.14, 0.08]
+    elif (not has_indicator) and has_votes:
+        row_heights = [0.23, 0.16, 0.12, 0.15, 0.09, 0.15, 0.10]
+    else:
+        row_heights = [0.27, 0.19, 0.14, 0.16, 0.15, 0.09]
+
+    specs = [[{"secondary_y": False}] for _ in range(total_rows)]
+    specs[row_dd_nav - 1] = [{"secondary_y": True}]
+
+    fig = make_subplots(
+        rows=total_rows,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        subplot_titles=tuple(subplot_titles),
+        row_heights=row_heights,
+        specs=specs,
+    )
+
+    row_legend_map: dict[int, str] = {}
+
+    def _row_legend_id(row: int) -> str:
+        if row in row_legend_map:
+            return row_legend_map[row]
+        legend_id = "legend" if not row_legend_map else f"legend{len(row_legend_map) + 1}"
+        row_legend_map[row] = legend_id
+        return legend_id
+
+    def _add_trace(trace: go.BaseTraceType, row: int, *, secondary_y: bool = False, use_row_legend: bool = True) -> None:
+        if use_row_legend:
+            trace.legend = _row_legend_id(row)
+        fig.add_trace(trace, row=row, col=1, secondary_y=secondary_y)
 
     # Row 1: 股價與買賣點
     if not df_raw_aligned.empty and close_col:
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=df_raw_aligned.index,
                 y=pd.to_numeric(df_raw_aligned[close_col], errors="coerce"),
@@ -221,7 +249,6 @@ def create_unified_dashboard(
                 line=dict(color="#636EFA", width=1.5),
             ),
             row=1,
-            col=1,
         )
 
     if trade_df is not None and not trade_df.empty:
@@ -237,7 +264,7 @@ def create_unified_dashboard(
             normal_sells = sells[~sells[type_col].astype(str).str.contains("forced", case=False, na=False)]
 
             if not buys.empty:
-                fig.add_trace(
+                _add_trace(
                     go.Scatter(
                         x=buys["trade_date"],
                         y=pd.to_numeric(buys["price"], errors="coerce"),
@@ -246,10 +273,9 @@ def create_unified_dashboard(
                         marker=dict(symbol="triangle-up", size=9, color="#00CC96"),
                     ),
                     row=1,
-                    col=1,
                 )
             if not normal_sells.empty:
-                fig.add_trace(
+                _add_trace(
                     go.Scatter(
                         x=normal_sells["trade_date"],
                         y=pd.to_numeric(normal_sells["price"], errors="coerce"),
@@ -258,10 +284,9 @@ def create_unified_dashboard(
                         marker=dict(symbol="triangle-down", size=9, color="#EF553B"),
                     ),
                     row=1,
-                    col=1,
                 )
             if not forced.empty:
-                fig.add_trace(
+                _add_trace(
                     go.Scatter(
                         x=forced["trade_date"],
                         y=pd.to_numeric(forced["price"], errors="coerce"),
@@ -270,37 +295,86 @@ def create_unified_dashboard(
                         marker=dict(symbol="square", size=7, color="#888888"),
                     ),
                     row=1,
-                    col=1,
                 )
 
-    # Row 2: 權益與現金
+    if has_indicator and row_indicator is not None:
+        smaa_series = pd.to_numeric(indicator.get("smaa"), errors="coerce")
+        _add_trace(
+            go.Scatter(
+                x=indicator.index,
+                y=smaa_series,
+                name=labels["smaa"],
+                line=dict(color="#4dabf7", width=1.6),
+            ),
+            row=row_indicator,
+        )
+        if "base" in indicator.columns:
+            _add_trace(
+                go.Scatter(
+                    x=indicator.index,
+                    y=pd.to_numeric(indicator["base"], errors="coerce"),
+                    name=labels["base"],
+                    line=dict(color="#f59f00", width=1.2),
+                ),
+                row=row_indicator,
+            )
+        if "buy_threshold" in indicator.columns:
+            _add_trace(
+                go.Scatter(
+                    x=indicator.index,
+                    y=pd.to_numeric(indicator["buy_threshold"], errors="coerce"),
+                    name=labels["buy_threshold"],
+                    line=dict(color="#40c057", width=1.2, dash="dot"),
+                ),
+                row=row_indicator,
+            )
+        if "sell_threshold" in indicator.columns:
+            _add_trace(
+                go.Scatter(
+                    x=indicator.index,
+                    y=pd.to_numeric(indicator["sell_threshold"], errors="coerce"),
+                    name=labels["sell_threshold"],
+                    line=dict(color="#fa5252", width=1.2, dash="dash"),
+                ),
+                row=row_indicator,
+            )
+        if "prom_threshold" in indicator.columns:
+            _add_trace(
+                go.Scatter(
+                    x=indicator.index,
+                    y=pd.to_numeric(indicator["prom_threshold"], errors="coerce"),
+                    name=labels["prom_threshold"],
+                    line=dict(color="#FFD166", width=1.2, dash="dashdot"),
+                ),
+                row=row_indicator,
+            )
+
+    # Row 權益與現金
     if not ds.empty:
         if "equity" in ds.columns:
-            fig.add_trace(
+            _add_trace(
                 go.Scatter(
                     x=ds.index,
                     y=pd.to_numeric(ds["equity"], errors="coerce"),
                     name=labels["equity"],
                     line=dict(color="#00CC96", width=2),
                 ),
-                row=2,
-                col=1,
+                row=row_eq,
             )
         if "cash" in ds.columns:
-            fig.add_trace(
+            _add_trace(
                 go.Scatter(
                     x=ds.index,
                     y=pd.to_numeric(ds["cash"], errors="coerce"),
                     name=labels["cash"],
                     line=dict(color="#FFA15A", width=1.5, dash="dot"),
                 ),
-                row=2,
-                col=1,
+                row=row_eq,
             )
 
-    # Row 3: 持倉權重
+    # Row 持倉權重
     if not ds.empty and "w" in ds.columns:
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=ds.index,
                 y=pd.to_numeric(ds["w"], errors="coerce") * 100,
@@ -308,18 +382,17 @@ def create_unified_dashboard(
                 fill="tozeroy",
                 line=dict(color="#AB63FA", width=1.5),
             ),
-            row=3,
-            col=1,
+            row=row_weight,
         )
 
-    # Row 4: LIFO 報酬
+    # Row LIFO 報酬
     lifo_y_range = None
     if trade_df is not None and not trade_df.empty:
         lifo_df = calculate_lifo_returns(trade_df)
         valid_lifo = lifo_df[lifo_df["lifo_return"].notna()] if "lifo_return" in lifo_df.columns else pd.DataFrame()
         if not valid_lifo.empty:
             colors = ["#00CC96" if x > 0 else "#EF553B" for x in valid_lifo["lifo_return"]]
-            fig.add_trace(
+            _add_trace(
                 go.Bar(
                     x=valid_lifo["trade_date"],
                     y=valid_lifo["lifo_return"],
@@ -328,10 +401,9 @@ def create_unified_dashboard(
                     opacity=0.95,
                     hovertemplate="日期: %{x}<br>報酬: %{y:.2%}<extra></extra>",
                 ),
-                row=4,
-                col=1,
+                row=row_lifo,
             )
-            fig.add_hline(y=0, line_color="gray", line_width=1, row=4, col=1)
+            fig.add_hline(y=0, line_color="gray", line_width=1, row=row_lifo, col=1)
 
             returns_array = valid_lifo["lifo_return"].to_numpy(dtype=float)
             returns_array = returns_array[np.isfinite(returns_array)]
@@ -389,7 +461,7 @@ def create_unified_dashboard(
         except Exception:
             vs = votes_series
 
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=vs.index,
                 y=vs.values,
@@ -397,10 +469,9 @@ def create_unified_dashboard(
                 line=dict(color="#28a745", width=1.8),
             ),
             row=row_votes,
-            col=1,
         )
         if votes_threshold is not None:
-            fig.add_trace(
+            _add_trace(
                 go.Scatter(
                     x=vs.index,
                     y=[votes_threshold] * len(vs),
@@ -408,12 +479,11 @@ def create_unified_dashboard(
                     line=dict(color="#ff6b6b", dash="dash", width=1.2),
                 ),
                 row=row_votes,
-                col=1,
             )
 
     # Row DD/NAV
     if not bench_dd.empty:
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=bench_dd.index,
                 y=bench_dd,
@@ -422,10 +492,9 @@ def create_unified_dashboard(
                 hovertemplate="BH回撤: %{y:.2%}<extra></extra>",
             ),
             row=row_dd_nav,
-            col=1,
             secondary_y=False,
         )
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=strat_dd.index,
                 y=strat_dd,
@@ -434,10 +503,9 @@ def create_unified_dashboard(
                 hovertemplate="策略回撤: %{y:.2%}<extra></extra>",
             ),
             row=row_dd_nav,
-            col=1,
             secondary_y=False,
         )
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=relative_nav.index,
                 y=relative_nav,
@@ -446,7 +514,6 @@ def create_unified_dashboard(
                 hovertemplate="相對淨值比: %{y:.3f}<extra></extra>",
             ),
             row=row_dd_nav,
-            col=1,
             secondary_y=True,
         )
         fig.add_hline(
@@ -457,7 +524,7 @@ def create_unified_dashboard(
             row=row_dd_nav,
             col=1,
         )
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=relative_nav.index,
                 y=np.ones(len(relative_nav), dtype=float),
@@ -467,13 +534,13 @@ def create_unified_dashboard(
                 hoverinfo="skip",
             ),
             row=row_dd_nav,
-            col=1,
             secondary_y=True,
+            use_row_legend=False,
         )
 
     # Row 滾動超額（30/60 日）
     if not rolling_excess_30.empty:
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=rolling_excess_30.index,
                 y=rolling_excess_30,
@@ -482,10 +549,9 @@ def create_unified_dashboard(
                 hovertemplate="30日超額: %{y:.2%}<extra></extra>",
             ),
             row=row_rolling,
-            col=1,
         )
     if not rolling_excess_60.empty:
-        fig.add_trace(
+        _add_trace(
             go.Scatter(
                 x=rolling_excess_60.index,
                 y=rolling_excess_60,
@@ -494,7 +560,6 @@ def create_unified_dashboard(
                 hovertemplate="60日超額: %{y:.2%}<extra></extra>",
             ),
             row=row_rolling,
-            col=1,
         )
     fig.add_hline(
         y=0,
@@ -510,23 +575,28 @@ def create_unified_dashboard(
         "light": {"template": "plotly_white", "paper_bgcolor": "#ffffff", "plot_bgcolor": "#f8f9fa", "font_color": "#2c3e50"},
     }
     cfg = theme_cfg.get(theme, theme_cfg["dark"])
+    if has_indicator:
+        height = 1900 if has_votes else 1680
+    else:
+        height = 1700 if has_votes else 1500
 
     fig.update_layout(
-        height=1700 if has_votes else 1500,
+        height=height,
         template=cfg["template"],
         paper_bgcolor=cfg["paper_bgcolor"],
         plot_bgcolor=cfg["plot_bgcolor"],
         font=dict(color=cfg["font_color"], size=11),
         hovermode="x unified",
-        margin=dict(l=60, r=20, t=60, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=60, r=20, t=80, b=40),
         bargap=0.1,
     )
 
     fig.update_xaxes(hoverformat="%Y-%m-%d")
     fig.update_yaxes(title_text=labels["axis_price"], row=1, col=1)
-    fig.update_yaxes(title_text=labels["axis_asset"], row=2, col=1)
-    fig.update_yaxes(title_text=labels["axis_weight"], range=[0, 110], row=3, col=1)
+    if has_indicator and row_indicator is not None:
+        fig.update_yaxes(title_text=labels["axis_indicator"], row=row_indicator, col=1)
+    fig.update_yaxes(title_text=labels["axis_asset"], row=row_eq, col=1)
+    fig.update_yaxes(title_text=labels["axis_weight"], range=[0, 110], row=row_weight, col=1)
 
     if lifo_y_range is not None:
         fig.update_yaxes(
@@ -536,7 +606,7 @@ def create_unified_dashboard(
             zeroline=True,
             zerolinecolor="gray",
             zerolinewidth=1,
-            row=4,
+            row=row_lifo,
             col=1,
         )
     else:
@@ -544,7 +614,7 @@ def create_unified_dashboard(
             title_text=labels["axis_ret"],
             tickformat=".1%",
             range=[-0.1, 0.1],
-            row=4,
+            row=row_lifo,
             col=1,
         )
 
@@ -574,6 +644,31 @@ def create_unified_dashboard(
         row=row_rolling,
         col=1,
     )
+
+    legend_bg = "rgba(255,255,255,0.18)" if theme == "light" else "rgba(10,10,10,0.18)"
+    legend_updates = {}
+    for row in sorted(row_legend_map.keys()):
+        subplot = fig.get_subplot(row, 1)
+        if subplot is None or subplot.yaxis is None or subplot.yaxis.domain is None:
+            continue
+        y_top = float(subplot.yaxis.domain[1])
+        legend_cfg = dict(
+            orientation="h",
+            yanchor="top",
+            y=max(y_top - 0.004, 0.0),
+            xanchor="left",
+            x=0.0,
+            bgcolor=legend_bg,
+            borderwidth=0,
+            font=dict(color=cfg["font_color"], size=10),
+            itemclick="toggleothers",
+            itemdoubleclick="toggle",
+        )
+        lid = row_legend_map[row]
+        legend_updates["legend" if lid == "legend" else lid] = legend_cfg
+
+    if legend_updates:
+        fig.update_layout(**legend_updates)
 
     return fig
 
