@@ -105,136 +105,179 @@ def calculate_smart_leverage_equity(daily_state, df_target, safe_ticker="0050.TW
         修改後的 daily_state (包含重新計算的 equity, cash, position_value)
     """
     try:
-        # 1. 準備數據
         if daily_state is None or daily_state.empty:
             return daily_state
-        if 'w' not in daily_state.columns:
+        if "w" not in daily_state.columns:
             logger.warning("Smart Leverage: daily_state 缺少 'w' 欄位，無法計算")
             return daily_state
 
-        # 載入防守資產 (0050)
         safe_path = Path(f"data/{safe_ticker.replace(':', '_')}_data_raw.csv")
-        if not safe_path.exists():
-            # 如果沒有就下載
-            logger.info(f"下載 {safe_ticker} 用於 Smart Leverage...")
-            import sys
-            import io
-            # 設置 stdout 編碼以避免 Unicode 錯誤
-            if sys.platform == 'win32':
-                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
-            df_safe = yf.download(safe_ticker, start="2010-01-01", auto_adjust=True, progress=False)
+
+        def _download_safe_history(start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
+            logger.info("下載 %s 用於 Smart Leverage... (%s ~ %s)", safe_ticker, start, end or "latest")
+            df_safe_dl = yf.download(safe_ticker, start=start, end=end, auto_adjust=True, progress=False)
+            if df_safe_dl is None or df_safe_dl.empty:
+                return None
+            if isinstance(df_safe_dl.columns, pd.MultiIndex):
+                df_safe_dl.columns = [str(c[0]).strip().lower() for c in df_safe_dl.columns]
+            else:
+                df_safe_dl.columns = [str(c).strip().lower() for c in df_safe_dl.columns]
             safe_path.parent.mkdir(parents=True, exist_ok=True)
-            df_safe.to_csv(safe_path, encoding='utf-8')
-            df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=True, encoding='utf-8')
-        else:
-            # 嘗試多種編碼讀取 CSV
+            df_safe_dl.to_csv(safe_path, encoding="utf-8")
+            return df_safe_dl
+
+        if not safe_path.exists():
+            df_safe_dl = _download_safe_history("2010-01-01")
+            if df_safe_dl is None:
+                logger.warning("Smart Leverage: 無法下載 %s，維持原始資料", safe_ticker)
+                return daily_state
+
+        try:
+            df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="utf-8")
+        except UnicodeDecodeError:
             try:
-                df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=True, encoding='utf-8')
+                df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="cp950")
             except UnicodeDecodeError:
-                try:
-                    df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=True, encoding='cp950')
-                except UnicodeDecodeError:
-                    df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=True, encoding='latin1')
+                df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="latin1")
 
-        # 統一欄位小寫
-        df_safe.columns = [c.lower() for c in df_safe.columns]
+        def _normalize_idx(df: pd.DataFrame) -> pd.DataFrame:
+            out = df.copy()
+            if isinstance(out.columns, pd.MultiIndex):
+                out.columns = [str(c[0]).strip().lower() for c in out.columns]
+            else:
+                out.columns = [str(c).strip().lower() for c in out.columns]
+            if not isinstance(out.index, pd.DatetimeIndex):
+                idx_text = pd.Index(out.index).map(lambda x: str(x).strip())
+                date_mask = idx_text.str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
+                out.index = pd.to_datetime(idx_text.where(date_mask), errors="coerce")
+            if out.index.tz is not None:
+                out.index = out.index.tz_localize(None)
+            out = out[out.index.notna()].sort_index()
+            return out
 
-        # 🔥 修復：強制將所有 Index 轉為統一的 datetime 格式（去除時區）
-        # 問題根源：daily_state.index 可能是字串 ("2015-07-27")，df_target/df_safe 是 datetime64[ns]
-        # 且可能存在 timezone aware/naive 不一致的狀況
+        ds_raw = _normalize_idx(daily_state)
+        tgt = _normalize_idx(df_target if isinstance(df_target, pd.DataFrame) else pd.DataFrame())
+        safe = _normalize_idx(df_safe)
 
-        # 處理 daily_state
-        daily_state = daily_state.copy()
-        if not isinstance(daily_state.index, pd.DatetimeIndex):
-            daily_state.index = pd.to_datetime(daily_state.index, errors='coerce')
-        if daily_state.index.tz is not None:
-            daily_state.index = daily_state.index.tz_localize(None)
-
-        # 處理 df_target
-        df_target = df_target.copy()
-        if not isinstance(df_target.index, pd.DatetimeIndex):
-            df_target.index = pd.to_datetime(df_target.index, errors='coerce')
-        if df_target.index.tz is not None:
-            df_target.index = df_target.index.tz_localize(None)
-        # 🔥 強制轉型：確保 target 的收盤價是數字
-        if 'close' in df_target.columns:
-            df_target['close'] = pd.to_numeric(df_target['close'], errors='coerce')
-
-        # 處理 df_safe
-        if not isinstance(df_safe.index, pd.DatetimeIndex):
-            df_safe.index = pd.to_datetime(df_safe.index, errors='coerce')
-        if df_safe.index.tz is not None:
-            df_safe.index = df_safe.index.tz_localize(None)
-        # 🔥 強制轉型：確保 safe 的收盤價是數字
-        if 'close' in df_safe.columns:
-            df_safe['close'] = pd.to_numeric(df_safe['close'], errors='coerce')
-
-        # 2. 對齊時間軸 (現在應該能正確對齊)
-        common_idx = daily_state.index.intersection(df_target.index).intersection(df_safe.index)
-
-        # 🔥 額外保險：確保 common_idx 有排序
-        common_idx = common_idx.sort_values()
-
-        if len(common_idx) == 0:
-            logger.warning(f"Smart Leverage: 無法對齊時間軸 (daily_state: {daily_state.index.min()} ~ {daily_state.index.max()}, "
-                          f"df_target: {df_target.index.min()} ~ {df_target.index.max()}, "
-                          f"df_safe: {df_safe.index.min()} ~ {df_safe.index.max()})")
+        if ds_raw.empty:
+            logger.warning("Smart Leverage: daily_state 日期索引無效，維持原始資料")
             return daily_state
 
-        logger.info(f"✅ Smart Leverage: 成功對齊時間軸，共 {len(common_idx)} 天 ({common_idx[0].date()} ~ {common_idx[-1].date()})")
+        safe_needs_refresh = False
+        if "close" not in safe.columns or safe.empty:
+            safe_needs_refresh = True
+        else:
+            ds_min = ds_raw.index.min()
+            ds_max = ds_raw.index.max()
+            safe_min = safe.index.min()
+            safe_max = safe.index.max()
+            if (safe_min - ds_min).days > 5 or (ds_max - safe_max).days > 5:
+                safe_needs_refresh = True
 
-        # 截取數據
-        w = daily_state.loc[common_idx, 'w'].fillna(0).values
-        # 攻擊資產日報酬
-        r_target = df_target.loc[common_idx, 'close'].pct_change().fillna(0).values
-        # 防守資產日報酬
-        r_safe = df_safe.loc[common_idx, 'close'].pct_change().fillna(0).values
+        if safe_needs_refresh:
+            refresh_start = min(ds_raw.index.min(), pd.Timestamp("2010-01-01")).strftime("%Y-%m-%d")
+            refresh_end = (ds_raw.index.max() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+            safe_dl = _download_safe_history(refresh_start, refresh_end)
+            if safe_dl is not None and not safe_dl.empty:
+                safe = _normalize_idx(safe_dl)
 
-        # 3. 逐日計算新淨值
-        initial_equity = daily_state.loc[common_idx[0], 'equity']
-        smart_equity = np.zeros(len(common_idx))
+        if "close" not in tgt.columns:
+            logger.warning("Smart Leverage: 目標資產缺少 close 欄位，維持原始資料")
+            return daily_state
+        if "close" not in safe.columns:
+            logger.warning("Smart Leverage: 防守資產缺少 close 欄位，維持原始資料")
+            return daily_state
+
+        tgt_close = pd.to_numeric(tgt["close"], errors="coerce")
+        safe_close = pd.to_numeric(safe["close"], errors="coerce")
+        w_series = pd.to_numeric(ds_raw.get("w"), errors="coerce").clip(0.0, 1.0)
+
+        equity_col = "equity" if "equity" in ds_raw.columns else ("portfolio_value" if "portfolio_value" in ds_raw.columns else None)
+        if equity_col is None:
+            logger.warning("Smart Leverage: daily_state 缺少 equity/portfolio_value，維持原始資料")
+            return daily_state
+        equity_series = pd.to_numeric(ds_raw[equity_col], errors="coerce")
+
+        common_idx = ds_raw.index.intersection(tgt_close.index).intersection(safe_close.index)
+        common_idx = common_idx.sort_values()
+        if len(common_idx) < 2:
+            logger.warning("Smart Leverage: 可用交集資料不足 (%d 筆)", len(common_idx))
+            return daily_state
+
+        ds = ds_raw.reindex(common_idx).copy()
+        w_aligned = w_series.reindex(common_idx).ffill().fillna(0.0).clip(0.0, 1.0)
+        tgt_aligned = tgt_close.reindex(common_idx)
+        safe_aligned = safe_close.reindex(common_idx)
+        eq_aligned = equity_series.reindex(common_idx).ffill()
+
+        valid_mask = tgt_aligned.notna() & safe_aligned.notna() & eq_aligned.notna() & w_aligned.notna()
+        valid_idx = common_idx[valid_mask]
+        if len(valid_idx) < 2:
+            logger.warning("Smart Leverage: 有效資料不足 (%d 筆)", len(valid_idx))
+            return daily_state
+
+        ds = ds.loc[valid_idx].copy()
+        w_aligned = w_aligned.loc[valid_idx]
+        tgt_aligned = tgt_aligned.loc[valid_idx]
+        safe_aligned = safe_aligned.loc[valid_idx]
+        eq_aligned = eq_aligned.loc[valid_idx]
+
+        initial_equity = float(eq_aligned.iloc[0])
+        if not np.isfinite(initial_equity) or initial_equity <= 0:
+            logger.warning("Smart Leverage: 初始權益異常 (%s)，維持原始資料", initial_equity)
+            return daily_state
+
+        r_target = tgt_aligned.pct_change().fillna(0.0)
+        r_safe = safe_aligned.pct_change().fillna(0.0)
+
+        fee_rate = 0.001425 * 0.3
+        tax_rate = 0.001  # ETF 稅率：僅在賣出腿計入
+
+        smart_equity = np.full(len(valid_idx), np.nan, dtype=float)
         smart_equity[0] = initial_equity
 
-        # 交易成本參數
-        FEE_RATE = 0.001425 * 0.3
-        TAX_RATE = 0.001  # ETF 稅率
+        for i in range(1, len(valid_idx)):
+            prev_eq = float(smart_equity[i - 1])
+            if not np.isfinite(prev_eq) or prev_eq <= 0:
+                smart_equity[i] = prev_eq
+                continue
 
-        w_prev = 0.0
+            w_prev = float(w_aligned.iloc[i - 1])
+            w_curr = float(w_aligned.iloc[i])
+            turnover = abs(w_curr - w_prev)
 
-        for i in range(1, len(common_idx)):
-            curr_eq = smart_equity[i-1]
-            w_prev_val = w[i-1]
-            w_curr = w[i] if i < len(w) else w_prev_val
+            rebalance_cost = 0.0
+            if turnover > 1e-9:
+                trade_notional = turnover * prev_eq
+                # 在攻擊/防守兩資產間換倉：一買一賣，雙邊手續費 + 賣出端交易稅。
+                rebalance_cost = trade_notional * (2.0 * fee_rate + tax_rate)
 
-            # 計算權重變化產生的成本
-            delta_w = w_curr - w_prev
-            cost = 0.0
-            if abs(delta_w) > 0.001:
-                cost = abs(delta_w) * curr_eq * (FEE_RATE + TAX_RATE)
+            eq_after_cost = max(prev_eq - rebalance_cost, 0.0)
+            combined_ret = w_curr * float(r_target.iloc[i]) + (1.0 - w_curr) * float(r_safe.iloc[i])
+            smart_equity[i] = eq_after_cost * (1.0 + combined_ret)
 
-            post_cost_eq = curr_eq - cost
+        ds["w"] = w_aligned
+        ds["equity"] = smart_equity
+        if "portfolio_value" in ds.columns:
+            ds["portfolio_value"] = ds["equity"]
+        ds["cash"] = ds["equity"] * (1.0 - ds["w"])
+        ds["position_value"] = ds["equity"] * ds["w"]
+        total = ds["equity"].replace(0.0, np.nan)
+        ds["invested_pct"] = (ds["position_value"] / total).fillna(0.0).clip(0.0, 1.0)
+        ds["cash_pct"] = (ds["cash"] / total).fillna(0.0).clip(0.0, 1.0)
 
-            # 核心公式：總報酬 = (當期攻擊權重 * 攻擊報酬) + (當期防守權重 * 防守報酬)
-            combined_ret = (w_curr * r_target[i]) + ((1 - w_curr) * r_safe[i])
+        logger.info(
+            "✅ Smart Leverage 計算完成 (使用 %s，區間 %s ~ %s，最終權益: %s)",
+            safe_ticker,
+            valid_idx[0].date(),
+            valid_idx[-1].date(),
+            f"{smart_equity[-1]:,.0f}",
+        )
+        return ds
 
-            smart_equity[i] = post_cost_eq * (1 + combined_ret)
-            w_prev = w_curr
-
-        # 4. 替換原始數據
-        new_ds = daily_state.loc[common_idx].copy()
-        new_ds['equity'] = smart_equity
-        # 重新計算 cash (代表防守部位價值)
-        new_ds['cash'] = new_ds['equity'] * (1 - new_ds['w'])
-        new_ds['position_value'] = new_ds['equity'] * new_ds['w']
-
-        logger.info(f"✅ Smart Leverage 計算完成 (使用 {safe_ticker}，最終權益: {smart_equity[-1]:,.0f})")
-        return new_ds
-
-    except Exception as e:
-        logger.error(f"❌ Smart Leverage 計算失敗: {e}")
-        import traceback
-        traceback.print_exc()
-        return daily_state  # 失敗則回傳原樣
+    except Exception:
+        logger.exception("❌ Smart Leverage 計算失敗")
+        return daily_state
 
 def plot_trade_returns_bar(trades_df):
     """
@@ -1773,12 +1816,24 @@ def _apply_crash_overlay_to_result(
         trades_out.loc[overwrite_mask, "reason"] = crash_reason.loc[overwrite_mask]
         trades_df = trades_out
 
-    result["daily_state_valve"] = pack_df(ledger_df)
-    result["trade_ledger_valve"] = pack_df(trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame())
+    daily_state_valve_df = ledger_df.copy()
+    if isinstance(ds_valve, pd.DataFrame) and not ds_valve.empty:
+        ds_valve_aligned = ds_valve.reindex(daily_state_valve_df.index)
+        for col in ds_valve_aligned.columns:
+            if col not in daily_state_valve_df.columns:
+                daily_state_valve_df[col] = ds_valve_aligned[col]
+        if "w" in ds_valve_aligned.columns:
+            daily_state_valve_df["w"] = pd.to_numeric(ds_valve_aligned["w"], errors="coerce").ffill().fillna(0.0)
+
+    packed_daily_state_valve = pack_df(daily_state_valve_df)
+    packed_trade_ledger_valve = pack_df(trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame())
+
+    result["daily_state_valve"] = packed_daily_state_valve
+    result["trade_ledger_valve"] = packed_trade_ledger_valve
     result["weight_curve_valve"] = pack_series(w_eval)
     result["equity_curve_valve"] = pack_series(eq)
-    result["daily_state_std"] = pack_df(ledger_df)
-    result["trade_ledger_std"] = pack_df(trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame())
+    result["daily_state_std"] = packed_daily_state_valve
+    result["trade_ledger_std"] = packed_trade_ledger_valve
 
     existing_metrics = result.get("metrics", {})
     result["metrics"] = _recompute_metrics_from_equity_and_trades(eq, trades_df, existing_metrics)
@@ -2647,7 +2702,7 @@ app.layout = html.Div([
         # === 展開/收合按鈕 ===
         html.Div([
             dbc.Button(
-                "⚙️ 顯示/隱藏 進階參數 (風險閥門、策略倉庫、Ensemble)",
+                "⚙️ 顯示/隱藏 進階參數 (Crash Overlay、策略倉庫、Ensemble)",
                 id="collapse-button",
                 className="mb-2 w-100",
                 color="secondary",
@@ -2662,23 +2717,11 @@ app.layout = html.Div([
             id="collapse-settings",
             is_open=False,  # 預設關閉
             children=[
-                # Row 2: 全局風險閥門控制
+                # Row 2: 風險控制（保留 Crash Overlay / Smart Leverage）
                 dbc.Row(id='ctrl-row-risk', children=[
                     dbc.Col([
-                        html.Label("🔧 全局風險閥門", id='label-risk-title', className="small mb-1 fw-bold"),
-                        dbc.Checkbox(id='global-apply-switch', value=False, label="啟用全局參數套用", className="small"),
-                    ], width=2),
-                    dbc.Col([
-                        html.Label("風險 CAP", className="small mb-1"),
-                        dcc.Input(id='risk-cap-input', type='number', min=0.1, max=1.0, step=0.1, value=0.3, style={'width': '70px'}),
-                    ], width=1),
-                    dbc.Col([
-                        html.Label("ATR 比值門檻", className="small mb-1"),
-                        dcc.Input(id='atr-ratio-threshold', type='number', min=0.5, max=2.0, step=0.1, value=1.0, style={'width': '70px'}),
-                    ], width=1),
-                    dbc.Col([
+                        html.Label("🔧 風險控制", id='label-risk-title', className="small mb-1 fw-bold"),
                         html.Label("測試選項", className="small mb-1"),
-                        dbc.Checkbox(id='force-valve-trigger', value=False, label="強制觸發閥門", className="small text-danger"),
                         dbc.Checkbox(id='smart-leverage-switch', value=False, label="Smart Leverage (0050代替現金)", className="small text-success fw-bold"),
                         dbc.Checkbox(id='crash-overlay-switch', value=False, label="Crash-only Overlay", className="small text-warning fw-bold mt-1"),
                         dcc.Dropdown(
@@ -2688,10 +2731,7 @@ app.layout = html.Div([
                             clearable=False,
                             style={"marginTop": "4px", "fontSize": "12px"},
                         ),
-                    ], width=3),
-                    dbc.Col([
-                        html.Div(id='risk-valve-status', className="small p-2", style={"borderRadius":"4px"}),
-                    ], width=5),
+                    ], width=12),
                 ], className='p-2 mb-2', style={'borderRadius': '4px'}),
 
                 # Row 3: 策略倉庫 & 兩組 Ensemble 參數 + 執行按鈕
@@ -2811,182 +2851,6 @@ def update_warehouse_list(n):
         return options, "strategy_warehouse.json"
     return [], "strategy_warehouse.json"
 
-# --------- 風險閥門狀態更新 ---------
-@app.callback(
-    Output('risk-valve-status', 'children'),
-    [
-        Input('global-apply-switch', 'value'),
-        Input('risk-cap-input', 'value'),
-        Input('atr-ratio-threshold', 'value'),
-        Input('force-valve-trigger', 'value'),
-        Input('ticker-dropdown', 'value'),
-        Input('start-date', 'value'),
-        Input('end-date', 'value')
-    ]
-)
-def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, ticker, start_date, end_date):
-    """動態更新風險閥門狀態顯示"""
-    logger.info(f"=== 風險閥門狀態更新 ===")
-    logger.info(f"global_apply: {global_apply}")
-    logger.info(f"risk_cap: {risk_cap}")
-    logger.info(f"atr_ratio: {atr_ratio}")
-    logger.info(f"force_trigger: {force_trigger}")
-    logger.info(f"ticker: {ticker}")
-    logger.info(f"start_date: {start_date}")
-    logger.info(f"end_date: {end_date}")
-
-    if not global_apply:
-        logger.info("風險閥門未啟用")
-        return html.Div([
-            html.Small("🔴 風險閥門未啟用", style={"color":"#dc3545","fontWeight":"bold"}),
-            html.Br(),
-            html.Small("點擊上方複選框啟用全局風險控制", style={"color":"#666","fontSize":"10px"})
-        ])
-
-    # 如果啟用，嘗試載入數據並計算 ATR 比值
-    try:
-        if ticker and start_date:
-            logger.info(f"開始載入數據: ticker={ticker}, start_date={start_date}, end_date={end_date}")
-            df_raw, _ = load_data(ticker, start_date, end_date if end_date else None, "Self")
-            logger.info(f"數據載入結果: 空={df_raw.empty}, 形狀={df_raw.shape if not df_raw.empty else 'N/A'}")
-
-            if not df_raw.empty:
-                # 計算 ATR 比值
-                logger.info("開始計算 ATR 比值")
-                atr_20 = calculate_atr(df_raw, 20)
-                atr_60 = calculate_atr(df_raw, 60)
-                logger.info(f"ATR 計算完成: atr_20={type(atr_20)}, atr_60={type(atr_60)}")
-
-                # 加入除錯資訊
-                debug_info = []
-                debug_info.append(f"數據欄位: {list(df_raw.columns)}")
-                debug_info.append(f"數據行數: {len(df_raw)}")
-                debug_info.append(f"ATR(20) 類型: {type(atr_20)}")
-                debug_info.append(f"ATR(60) 類型: {type(atr_60)}")
-
-                if atr_20 is not None:
-                    debug_info.append(f"ATR(20) 長度: {len(atr_20) if hasattr(atr_20, '__len__') else 'N/A'}")
-                    debug_info.append(f"ATR(20) 非空值: {atr_20.notna().sum() if hasattr(atr_20, 'notna') else 'N/A'}")
-
-                if atr_60 is not None:
-                    debug_info.append(f"ATR(60) 長度: {len(atr_60) if hasattr(atr_60, '__len__') else 'N/A'}")
-                    debug_info.append(f"ATR(60) 非空值: {atr_60.notna().sum() if hasattr(atr_60, 'notna') else 'N/A'}")
-
-                # 確保 ATR 數據有效
-                if (atr_20 is not None and atr_60 is not None and
-                    hasattr(atr_20, 'empty') and hasattr(atr_60, 'empty') and
-                    not atr_20.empty and not atr_60.empty):
-
-                    # 檢查是否有足夠的非空值
-                    atr_20_valid = atr_20.dropna()
-                    atr_60_valid = atr_60.dropna()
-
-                    if len(atr_20_valid) > 0 and len(atr_60_valid) > 0:
-                        # 取最新的 ATR 值進行比較
-                        atr_20_latest = atr_20_valid.iloc[-1]
-                        atr_60_latest = atr_60_valid.iloc[-1]
-
-                        debug_info.append(f"ATR(20) 最新值: {atr_20_latest:.6f}")
-                        debug_info.append(f"ATR(60) 最新值: {atr_60_latest:.6f}")
-
-                        if atr_60_latest > 0:
-                            atr_ratio_current = atr_20_latest / atr_60_latest
-                            debug_info.append(f"ATR 比值: {atr_ratio_current:.4f}")
-
-                            # 判斷是否需要觸發風險閥門
-                            valve_triggered = atr_ratio_current > atr_ratio
-
-                            # 如果啟用強制觸發，則強制觸發風險閥門
-                            if force_trigger:
-                                valve_triggered = True
-                                logger.info(f"強制觸發風險閥門啟用")
-
-                            # 記錄風險閥門狀態到日誌
-                            logger.info(f"ATR 比值計算: {atr_20_latest:.6f} / {atr_60_latest:.6f} = {atr_ratio_current:.4f}")
-                            logger.info(f"風險閥門門檻: {atr_ratio}, 當前比值: {atr_ratio_current:.4f}")
-                            logger.info(f"風險閥門觸發: {'是' if valve_triggered else '否'}")
-                            logger.info(f"風險閥門狀態: {'🔴 觸發' if valve_triggered else '🟢 正常'}")
-
-                            status_color = "#dc3545" if valve_triggered else "#28a745"
-                            status_icon = "🔴" if valve_triggered else "🟢"
-                            status_text = "觸發" if valve_triggered else "正常"
-
-                            # 加入強制觸發的狀態顯示
-                            force_status = ""
-                            if force_trigger:
-                                force_status = html.Br() + html.Small("🔴 強制觸發已啟用", style={"color":"#dc3545","fontWeight":"bold","fontSize":"10px"})
-
-                            return html.Div([
-                                html.Div([
-                                    html.Small(f"{status_icon} 風險閥門狀態: {status_text}",
-                                              style={"color":status_color,"fontWeight":"bold","fontSize":"12px"}),
-                                    force_status,
-                                    html.Br(),
-                                    html.Small(f"ATR(20)/ATR(60) = {atr_ratio_current:.2f}", style={"color":"#666","fontSize":"11px"}),
-                                    html.Br(),
-                                    html.Small(f"門檻值: {atr_ratio}", style={"color":"#666","fontSize":"11px"}),
-                                    html.Br(),
-                                    html.Small(f"風險CAP: {risk_cap*100:.0f}%", style={"color":"#666","fontSize":"11px"}),
-                                    html.Br(),
-                                    html.Small(f"保留下限: {(1-risk_cap)*100:.0f}%", style={"color":"#666","fontSize":"11px"}),
-                                    html.Br(),
-                                    html.Small("--- 除錯資訊 ---", style={"color":"#999","fontSize":"10px","fontStyle":"italic"}),
-                                    html.Small([html.Div(info) for info in debug_info], style={"color":"#999","fontSize":"9px"})
-                                ])
-                            ])
-                        else:
-                            logger.warning(f"ATR(60) 值為 0，無法計算比值: {atr_60_latest:.6f}")
-                            return html.Div([
-                                html.Small("🟡 ATR 計算異常", style={"color":"#ffc107","fontWeight":"bold"}),
-                                html.Br(),
-                                html.Small(f"ATR(60) 值為 {atr_60_latest:.6f}，無法計算比值", style={"color":"#666","fontSize":"10px"}),
-                                html.Br(),
-                                html.Small("--- 除錯資訊 ---", style={"color":"#999","fontSize":"10px","fontStyle":"italic"}),
-                                html.Small([html.Div(info) for info in debug_info], style={"color":"#999","fontSize":"9px"})
-                            ])
-                    else:
-                        logger.warning(f"ATR 數據不足: ATR(20) 有效值={len(atr_20_valid)}, ATR(60) 有效值={len(atr_60_valid)}")
-                        return html.Div([
-                            html.Small("🟡 ATR 數據不足", style={"color":"#ffc107","fontWeight":"bold"}),
-                            html.Br(),
-                            html.Small(f"ATR(20) 有效值: {len(atr_20_valid)}, ATR(60) 有效值: {len(atr_60_valid)}", style={"color":"#666","fontSize":"10px"}),
-                            html.Br(),
-                            html.Small("--- 除錯資訊 ---", style={"color":"#999","fontSize":"10px","fontStyle":"italic"}),
-                            html.Small([html.Div(info) for info in debug_info], style={"color":"#999","fontSize":"9px"})
-                        ])
-                else:
-                    logger.warning("ATR 數據無效，無法計算比值")
-                    return html.Div([
-                        html.Small("🟡 ATR 數據無效", style={"color":"#ffc107","fontWeight":"bold"}),
-                        html.Br(),
-                        html.Small("無法計算 ATR 比值", style={"color":"#666","fontSize":"10px"}),
-                        html.Br(),
-                        html.Small("--- 除錯資訊 ---", style={"color":"#999","fontSize":"10px","fontStyle":"italic"}),
-                        html.Small([html.Div(info) for info in debug_info], style={"color":"#666","fontSize":"9px"})
-                    ])
-
-            else:
-                logger.warning(f"無法載入數據: ticker={ticker}, start_date={start_date}")
-                return html.Div([
-                    html.Small("🟡 無法載入數據", style={"color":"#ffc107","fontWeight":"bold"}),
-                    html.Br(),
-                    html.Small("請先選擇股票代號和日期", style={"color":"#666","fontSize":"10px"})
-                ])
-        else:
-            logger.info("等待數據載入：未選擇股票代號或日期")
-            return html.Div([
-                html.Small("🟡 等待數據載入", style={"color":"#ffc107","fontWeight":"bold"}),
-                html.Br(),
-                html.Small("請選擇股票代號和日期", style={"color":"#666","fontSize":"10px"})
-            ])
-    except Exception as e:
-        logger.error(f"風險閥門狀態更新失敗: {e}")
-        return html.Div([
-            html.Small("🟡 計算中...", style={"color":"#ffc107","fontWeight":"bold"}),
-            html.Br(),
-            html.Small(f"錯誤: {str(e)}", style={"color":"#666","fontSize":"10px"})
-        ])
-
 # --------- 執行回測並存到 Store ---------
 @app.callback(
     Output('backtest-store', 'data'),
@@ -3000,10 +2864,6 @@ def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, t
         Input('discount-slider', 'value'),
         Input('cooldown-bars', 'value'),
         Input('bad-holding', 'value'),
-        Input('global-apply-switch', 'value'),
-        Input('risk-cap-input', 'value'),
-        Input('atr-ratio-threshold', 'value'),
-        Input('force-valve-trigger', 'value'),
         Input('crash-overlay-switch', 'value'),
         Input('crash-overlay-preset', 'value'),
         Input('warehouse-dropdown', 'value'),
@@ -3023,7 +2883,7 @@ def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, t
     State('backtest-store', 'data')
 )
 def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date, end_date, discount, cooldown, bad_holding,
-                global_apply, risk_cap, atr_ratio, force_trigger, crash_overlay_on, crash_overlay_preset, warehouse_file,
+                crash_overlay_on, crash_overlay_preset, warehouse_file,
                 maj_floor, maj_ema, maj_delta, maj_cooldown, maj_dw,
                 prop_floor, prop_ema, prop_delta, prop_cooldown, prop_dw,
                 stored_data):
@@ -3079,10 +2939,6 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                 logger.warning("[CrashOverlay] 載入市場特徵失敗: %s", exc)
                 crash_overlay_on = False
 
-    # === 新增：全局風險閥門觸發狀態追蹤 ===
-    valve_triggered = False
-    atr_ratio_current = None
-
     for strat in active_strategy_names:
         # 只使用 param_presets 中的參數
         strat_params = param_presets[strat].copy()
@@ -3090,7 +2946,6 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
         smaa_src = strat_params.get("smaa_source", "Self")
         data_provider = strat_params.get("data_provider", "yfinance")
         pine_parity_mode = bool(strat_params.get("pine_parity_mode", False))
-        atr_ratio_current = None
 
         # 為每個策略載入對應的數據
         df_raw, df_factor = load_data(
@@ -3102,57 +2957,6 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             pine_parity_mode=pine_parity_mode,
         )
 
-        # 應用全局風險閥門設定（如果啟用）
-        logger.info(f"[{strat}] 風險閥門開關狀態: global_apply={global_apply}, 類型={type(global_apply)}")
-        if global_apply:
-            logger.info(f"[{strat}] 應用全局風險閥門: CAP={risk_cap}, ATR比值門檻={atr_ratio}")
-
-            # 計算 ATR 比值（使用最新數據，僅用於日誌顯示）
-            try:
-                atr_20 = calculate_atr(df_raw, 20)
-                atr_60 = calculate_atr(df_raw, 60)
-
-                # 確保 ATR 數據有效
-                if not atr_20.empty and not atr_60.empty:
-                    atr_20_valid = atr_20.dropna()
-                    atr_60_valid = atr_60.dropna()
-
-                    # 檢查樣本數量是否足夠
-                    min_samples_20, min_samples_60 = 30, 60  # 至少需要 30 和 60 個樣本
-                    if len(atr_20_valid) < min_samples_20 or len(atr_60_valid) < min_samples_60:
-                        logger.warning(f"[{strat}] ATR 樣本不足，20期:{len(atr_20_valid)}/{min_samples_20}, 60期:{len(atr_60_valid)}/{min_samples_60}")
-                        atr_ratio_current = None
-
-                    atr_20_latest = atr_20_valid.iloc[-1]
-                    atr_60_latest = atr_60_valid.iloc[-1]
-
-                    # 檢查 ATR 值是否合理
-                    if atr_60_latest <= 0 or not np.isfinite(atr_60_latest):
-                        logger.warning(f"[{strat}] ATR(60) 值異常: {atr_60_latest}，跳過風險閥門")
-                        atr_ratio_current = None
-
-                    if atr_20_latest <= 0 or not np.isfinite(atr_20_latest):
-                        logger.warning(f"[{strat}] ATR(20) 值異常: {atr_20_latest}，跳過風險閥門")
-                        atr_ratio_current = None
-
-                    if atr_60_latest > 0 and np.isfinite(atr_20_latest) and np.isfinite(atr_60_latest):
-                        atr_ratio_current = atr_20_latest / atr_60_latest
-                        logger.info(f"[{strat}] ATR ratio={atr_ratio_current:.4f} (20={atr_20_latest:.4f}, 60={atr_60_latest:.4f})")
-                    else:
-                        atr_ratio_current = None
-                else:
-                    logger.warning(f"[{strat}] ATR 計算結果為空")
-
-                # 強制觸發時設置標記
-                if force_trigger:
-                    valve_triggered = True
-                    logger.info(f"[{strat}] 🔴 強制觸發風險閥門啟用")
-
-            except Exception as e:
-                logger.warning(f"[{strat}] ATR 計算失敗: {e}")
-        else:
-            logger.info(f"[{strat}] 未啟用全局風險閥門")
-
         if strat_type == 'ssma_turn':
             calc_keys = [
                 'linlen', 'factor', 'smaalen', 'prom_factor', 'min_dist',
@@ -3163,7 +2967,7 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             backtest_params = ssma_params.copy()
             backtest_params['stop_loss'] = strat_params.get('stop_loss', 0.0)
 
-            # 重新計算策略信號（因為參數可能已經被風險閥門調整）
+            # 重新計算策略信號（使用策略參數）
             df_ind, buy_dates, sell_dates = compute_ssma_turn_combined(df_raw, df_factor, **ssma_params, smaa_source=smaa_src)
             if df_ind.empty:
                 continue
@@ -3182,110 +2986,12 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                 indicator_daily=indicator_daily_df,
             )
 
-            # === 在 ssma_turn 也套用風險閥門（和 Ensemble 一致的後置覆寫） ===
-            if global_apply:
-                # 判斷是否要觸發（與你的 ATR 檢查或強制觸發一致）
-                valve_triggered_local = False
-                ratio_local = None
-                try:
-                    atr_20 = calculate_atr(df_raw, 20)
-                    atr_60 = calculate_atr(df_raw, 60)
-                    if not atr_20.empty and not atr_60.empty:
-                        a20 = atr_20.dropna().iloc[-1]
-                        a60 = atr_60.dropna().iloc[-1]
-                        if a60 > 0:
-                            ratio_local = float(a20 / a60)
-                            valve_triggered_local = (ratio_local > atr_ratio)  # 與進階分析一致：使用 ">"
-                except Exception:
-                    pass
-
-                if force_trigger:
-                    valve_triggered_local = True
-                    if ratio_local is None:
-                        ratio_local = 1.5
-
-                if valve_triggered_local:
-                    from SSS_EnsembleTab import risk_valve_backtest, CostParams
-                    # 取得 open 價；df_raw 欄位名稱是小寫
-                    open_px = df_raw['open'] if 'open' in df_raw.columns else df_raw['close']
-                    # 從回測輸出抓 w（先用標準化 daily_state，如果沒有就用原 daily_state）
-                    w_series = None
-                    try:
-                        ds_std = df_from_pack(result.get('daily_state_std'))
-                        if ds_std is not None and not ds_std.empty and 'w' in ds_std.columns:
-                            w_series = ds_std['w']
-                    except Exception:
-                        pass
-                    if w_series is None:
-                        ds = df_from_pack(result.get('daily_state'))
-                        if ds is not None and not ds.empty and 'w' in ds.columns:
-                            w_series = ds['w']
-
-                    if w_series is not None:
-                        # 交易成本（與 Ensemble 分支一致）
-                        trade_cost = strat_params.get('trade_cost', {})
-                        cost_params = CostParams(
-                            buy_fee_bp=float(trade_cost.get("buy_fee_bp", 4.27)),
-                            sell_fee_bp=float(trade_cost.get("sell_fee_bp", 4.27)),
-                            sell_tax_bp=float(trade_cost.get("sell_tax_bp", 30.0))
-                        )
-
-                        # === 全局套用風險閥門：確保參數一致性 (2025/08/20) ===
-                        global_valve_params = {
-                            "open_px": open_px,
-                            "w": w_series,
-                            "cost": cost_params,
-                            "benchmark_df": df_raw,
-                            "mode": "cap",
-                            "cap_level": float(risk_cap),
-                            "slope20_thresh": 0.0,
-                            "slope60_thresh": 0.0,
-                            "atr_win": 20,
-                            "atr_ref_win": 60,
-                            "atr_ratio_mult": float(ratio_local if ratio_local is not None else atr_ratio),   # 若你有 local ratio，就用 local；否則全局 atr_ratio
-                            "use_slopes": True,
-                            "slope_method": "polyfit",
-                            "atr_cmp": "gt"
-                        }
-
-                        # 記錄全局風險閥門配置
-                        logger.info(f"[Global] 風險閥門配置: cap_level={global_valve_params['cap_level']}, atr_ratio_mult={global_valve_params['atr_ratio_mult']}")
-
-                        rv = risk_valve_backtest(**global_valve_params)
-
-                        # app_dash.py / 2025-08-22 15:30
-                        # 全局風險閥門：同時保存 baseline 與 valve 版本，不覆寫標準鍵
-                        # 1) 保存 valve 版本到專用鍵
-                        result['equity_curve_valve']     = pack_series(rv["daily_state_valve"]["equity"])
-                        result['daily_state_valve']      = pack_df(rv["daily_state_valve"])
-                        result['trade_ledger_valve']     = pack_df(rv["trade_ledger_valve"])
-                        result['weight_curve_valve']     = pack_series(rv["weights_valve"])
-
-                        # 2) 保存 baseline 版本到專用鍵（如果還沒有）
-                        if "daily_state_base" not in result and result.get("daily_state") is not None:
-                            result["daily_state_base"] = result["daily_state"]
-                        if "trade_ledger_base" not in result and result.get("trade_ledger") is not None:
-                            result["trade_ledger_base"] = result["trade_ledger"]
-                        if "weight_curve_base" not in result and result.get("weight_curve") is not None:
-                            result["weight_curve_base"] = result["weight_curve"]
-                        # 給 UI 的標記（下個小節會用到）
-                        result['valve'] = {
-                            "applied": True,
-                            "cap": float(risk_cap),
-                            "atr_ratio": ratio_local
-                        }
-
-                        logger.info(f"[{strat}] SSMA 風險閥門已套用（cap={risk_cap}, ratio={ratio_local:.4f}）")
-                    else:
-                        logger.warning(f"[{strat}] SSMA 無法取得權重序列，跳過風險閥門套用")
-                else:
-                    logger.info(f"[{strat}] SSMA 風險閥門未觸發，使用原始結果")
-                    # 給 UI 的標記（未觸發）
-                    result['valve'] = {
-                        "applied": False,
-                        "cap": float(risk_cap),
-                        "atr_ratio": ratio_local if ratio_local is not None else "N/A"
-                    }
+            # 全局風險閥門已移除
+            result['valve'] = {
+                "applied": False,
+                "cap": "N/A",
+                "atr_ratio": "N/A"
+            }
         elif strat_type == 'ensemble':# 使用新的 ensemble_runner 避免循環依賴
             result = {}
             if manager:
@@ -3366,12 +3072,12 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
             else:
                 logger.error("無法載入 Strategy Manager")
 
+            flat_params = {}
             try:
                 from runners.ensemble_runner import run_ensemble_backtest
                 from SSS_EnsembleTab import EnsembleParams, CostParams, RunConfig
 
                 # 把 SSSv096 的巢狀參數攤平
-                flat_params = {}
                 flat_params.update(strat_params.get('params', {}))
                 flat_params.update(strat_params.get('trade_cost', {}))
                 flat_params['method'] = strat_params.get('method', 'majority')
@@ -3439,147 +3145,8 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
 
                 logger.info(f"[Ensemble] 執行配置: ticker={ticker}, method={flat_params.get('method')}, majority_k_pct={flat_params.get('majority_k_pct', 'N/A')}")
 
-                # --- 新增：只在 ATR 觸發時啟用風險閥門 ---
-                valve_triggered = False
-                ratio = None
-                try:
-                    atr_20 = calculate_atr(df_raw, 20)
-                    atr_60 = calculate_atr(df_raw, 60)
-
-                    # 增加詳細的調試資訊
-                    logger.info(f"[{strat}] Ensemble ATR 計算: atr_20={type(atr_20)}, atr_60={type(atr_60)}")
-
-                    if not atr_20.empty and not atr_60.empty:
-                        atr_20_valid = atr_20.dropna()
-                        atr_60_valid = atr_60.dropna()
-
-                        logger.info(f"[{strat}] Ensemble ATR 有效值: atr_20={len(atr_20_valid)}, atr_60={len(atr_60_valid)}")
-
-                        if len(atr_20_valid) > 0 and len(atr_60_valid) > 0:
-                            a20 = atr_20_valid.iloc[-1]
-                            a60 = atr_60_valid.iloc[-1]
-
-                            logger.info(f"[{strat}] Ensemble ATR 最新值: a20={a20:.6f}, a60={a60:.6f}")
-
-                            if a60 > 0:
-                                ratio = float(a20 / a60)
-                                valve_triggered = (ratio > atr_ratio)  # 與進階分析一致：使用 ">"
-                                logger.info(f"[{strat}] Ensemble ATR 比值: {ratio:.4f} (門檻={atr_ratio}) -> 觸發={valve_triggered}")
-
-                                # 增加風險閥門觸發的詳細資訊
-                                if valve_triggered:
-                                    logger.info(f"[{strat}] 🔴 風險閥門觸發！ATR比值({ratio:.4f}) > 門檻({atr_ratio})")
-                                else:
-                                    logger.info(f"[{strat}] 🟢 風險閥門未觸發，ATR比值({ratio:.4f}) <= 門檻({atr_ratio})")
-                            else:
-                                logger.warning(f"[{strat}] Ensemble ATR(60) 值為 0，無法計算比值")
-                        else:
-                            logger.warning(f"[{strat}] Ensemble ATR 數據不足")
-                    else:
-                        logger.warning(f"[{strat}] Ensemble ATR 計算結果為空")
-
-                except Exception as e:
-                    logger.warning(f"[{strat}] 無法計算 Ensemble ATR 比值: {e}")
-                    logger.warning(f"[{strat}] 錯誤詳情: {type(e).__name__}: {str(e)}")
-
-                # 如果啟用強制觸發，則強制觸發風險閥門
-                if force_trigger:
-                    valve_triggered = True
-                    logger.info(f"[{strat}] 🔴 強制觸發風險閥門啟用")
-                    if ratio is None:
-                        ratio = 1.5  # 設定一個預設值用於顯示
-
                 # 使用新的 ensemble_runner 執行
                 backtest_result = run_ensemble_backtest(cfg)
-
-                # 若全局開關開啟且達觸發條件，才在權重序列上套用 CAP
-                if global_apply and valve_triggered:
-                    from SSS_EnsembleTab import risk_valve_backtest
-                    bench = df_raw  # 已含 open/high/low/close/volume
-
-                    logger.info(f"[{strat}] 🔴 開始套用風險閥門: cap={risk_cap}, ratio={ratio:.4f}")
-
-                    rv = risk_valve_backtest(
-                        open_px=backtest_result.price_series,
-                        w=backtest_result.weight_curve,
-                        cost=cost_params,
-                        benchmark_df=bench,
-                        mode="cap",
-                        cap_level=float(risk_cap),
-                        slope20_thresh=0.0, slope60_thresh=0.0,
-                        atr_win=20, atr_ref_win=60,
-                        atr_ratio_mult=float(atr_ratio),   # ← UI 的 ATR 門檻
-                        use_slopes=True,                   # ← 跟增強分析一致
-                        slope_method="polyfit",            # ← 跟增強分析一致
-                        atr_cmp="gt"                       # ← 跟增強分析一致（用 >）
-                    )
-                    # app_dash.py / 2025-08-22 15:30
-                    # 全局風險閥門：同時保存 baseline 與 valve 版本，不覆寫標準鍵
-                    # 1) 保存 valve 版本到專用鍵
-                    result['daily_state_valve'] = pack_df(rv["daily_state_valve"])
-                    result['trade_ledger_valve'] = pack_df(rv["trade_ledger_valve"])
-                    result['weight_curve_valve'] = pack_series(rv["weights_valve"])
-                    result['equity_curve_valve'] = pack_series(rv["daily_state_valve"]["equity"])
-
-                    # 2) 保存 baseline 版本到專用鍵（如果還沒有）
-                    if "daily_state_base" not in result and result.get("daily_state"):
-                        result["daily_state_base"] = result["daily_state"]
-                    if "trade_ledger_base" not in result and result.get("trade_ledger"):
-                        result["trade_ledger_base"] = result["trade_ledger"]
-                    if "weight_curve_base" not in result and result.get("weight_curve"):
-                        result["weight_curve_base"] = result["weight_curve"]
-
-                    # 3) 更新 backtest_result 物件（用於後續處理）
-                    backtest_result.daily_state = rv["daily_state_valve"]
-                    backtest_result.ledger = rv["trade_ledger_valve"]
-                    backtest_result.weight_curve = rv["weights_valve"]
-                    backtest_result.equity_curve = rv["daily_state_valve"]["equity"]
-                    logger.info(f"[{strat}] 風險閥門已套用（cap={risk_cap}, ratio={ratio:.4f}）")
-
-                    # 增加風險閥門效果的詳細資訊
-                    if "metrics" in rv:
-                        logger.info(f"[{strat}] 風險閥門效果: PF原始={rv['metrics'].get('pf_orig', 'N/A'):.2f}, PF閥門={rv['metrics'].get('pf_valve', 'N/A'):.2f}")
-                        logger.info(f"[{strat}] 風險閥門效果: MDD原始={rv['metrics'].get('mdd_orig', 'N/A'):.2f}%, MDD閥門={rv['metrics'].get('mdd_valve', 'N/A'):.2f}%")
-
-                    # 給 UI 的標記（與 SSMA 分支對齊）
-                    result['valve'] = {
-                        "applied": True,
-                        "cap": float(risk_cap),
-                        "atr_ratio": ratio
-                    }
-
-                    # 新增：讓全局區段知道已套用過
-                    result['_risk_valve_applied'] = True
-                else:
-                    if global_apply:
-                        logger.info(f"[{strat}] 🟢 風險閥門未觸發，使用原始參數")
-                        # 給 UI 的標記（未觸發）
-                        result['valve'] = {
-                            "applied": False,
-                            "cap": float(risk_cap),
-                            "atr_ratio": ratio if ratio is not None else "N/A"
-                        }
-                    else:
-                        logger.info(f"[{strat}] ⚪ 全局風險閥門未啟用")
-                        # 給 UI 的標記（未啟用）
-                        result['valve'] = {
-                            "applied": False,
-                            "cap": "N/A",
-                            "atr_ratio": "N/A"
-                        }
-
-                # 🔥 保存 valve 資訊（如果有的話）
-                valve_info = result.get('valve')
-                valve_data = {
-                    'daily_state_valve': result.get('daily_state_valve'),
-                    'trade_ledger_valve': result.get('trade_ledger_valve'),
-                    'weight_curve_valve': result.get('weight_curve_valve'),
-                    'equity_curve_valve': result.get('equity_curve_valve'),
-                    'daily_state_base': result.get('daily_state_base'),
-                    'trade_ledger_base': result.get('trade_ledger_base'),
-                    'weight_curve_base': result.get('weight_curve_base'),
-                    '_risk_valve_applied': result.get('_risk_valve_applied')
-                }
 
                 # 🔥🔥🔥 補強：計算完整績效指標（Ensemble 原生指標較陽春）🔥🔥🔥
                 metrics = backtest_result.stats.copy() if backtest_result.stats else {}
@@ -3651,18 +3218,16 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                     'trade_ledger': pack_df(backtest_result.ledger),
                     'daily_state_std': pack_df(backtest_result.daily_state),
                     'trade_ledger_std': pack_df(backtest_result.ledger),
+                    'valve': {
+                        "applied": False,
+                        "cap": "N/A",
+                        "atr_ratio": "N/A"
+                    },
                     'latest_t_signal': _extract_latest_t_signal(
                         strategy_type='ensemble',
                         daily_state=backtest_result.daily_state,
                     ),
                 }
-
-                # 🔥 恢復 valve 資訊
-                if valve_info:
-                    result['valve'] = valve_info
-                for k, v in valve_data.items():
-                    if v is not None:
-                        result[k] = v
 
                 logger.info(f"[Ensemble] 執行成功: 權益曲線長度={len(backtest_result.equity_curve)}, 交易數={len(backtest_result.ledger) if backtest_result.ledger is not None and not backtest_result.ledger.empty else 0}")
 
@@ -3719,19 +3284,11 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                 indicator_daily=indicator_daily_df,
             )
 
-            # 為其他策略類型添加 valve 標記
-            if global_apply:
-                result['valve'] = {
-                    "applied": False,  # 其他策略類型暫時不支援風險閥門
-                    "cap": float(risk_cap),
-                    "atr_ratio": "N/A"
-                }
-            else:
-                result['valve'] = {
-                    "applied": False,
-                    "cap": "N/A",
-                    "atr_ratio": "N/A"
-                }
+            result['valve'] = {
+                "applied": False,
+                "cap": "N/A",
+                "atr_ratio": "N/A"
+            }
         result["trade_cooldown_bars_used"] = int(cooldown or 0)
         # 統一使用 orient="split" 打包，避免重複序列化
         # 注意：Ensemble 策略已經在 pack_df/pack_series 中處理過，這裡只處理單策略
@@ -3752,258 +3309,6 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
 
         # << 新增：一律做最後保險打包，補上 daily_state / weight_curve 等 >>
         result = _pack_result_for_store(result)
-
-        # === 全局風險閥門：逐日動態套用（與增強分析一致） ===
-        if global_apply:
-            # 新增：若策略分支已經套用，就不要再來一次
-            if result.get('_risk_valve_applied'):
-                logger.info(f"[{strat}] 已由策略分支套用風險閥門，跳過全局再次套用")
-            else:
-                # 原本區塊從這裡開始
-                # 1) 取 ds（daily_state），並解包
-                ds_raw = result.get("daily_state_std") or result.get("daily_state")
-                ds = df_from_pack(ds_raw)
-                if ds is None or ds.empty or "w" not in ds.columns:
-                    logger.warning(f"[{strat}] daily_state 不含 'w'，跳過全局風險閥門")
-                else:
-                    # 2) 使用與進階分析一致的風險閥門判斷邏輯
-                    try:
-                        from SSS_EnsembleTab import compute_risk_valve_signals
-
-                        # 建立基準資料（有高低價就帶上）
-                        bench = _build_benchmark_df(df_raw)
-
-                        # 使用進階分析的預設參數：斜率門檻=0，ATR比值=1.5，比較符號=">"
-                        risk_signals = compute_risk_valve_signals(
-                            benchmark_df=bench,
-                            slope20_thresh=0.0,      # 20日斜率門檻
-                            slope60_thresh=0.0,      # 60日斜率門檻
-                            atr_win=20,              # ATR計算窗口
-                            atr_ref_win=60,          # ATR參考窗口
-                            atr_ratio_mult=float(atr_ratio),  # ATR比值門檻
-                            use_slopes=True,         # 啟用斜率條件
-                            slope_method="polyfit",   # 使用多項式擬合斜率
-                            atr_cmp="gt"             # 使用 ">" 比較符號
-                        )
-
-                        mask = risk_signals["risk_trigger"].reindex(ds.index).fillna(False)
-                        logger.info(f"[{strat}] 進階分析風險閥門：斜率條件啟用，ATR比值門檻={atr_ratio}")
-
-                    except Exception as e:
-                        logger.warning(f"[{strat}] 無法使用進階分析風險閥門，回退到 ATR-only: {e}")
-                        # 回退到原本的 ATR-only 邏輯
-                        atr20 = calculate_atr(df_raw, 20)
-                        atr60 = calculate_atr(df_raw, 60)
-                        if atr20 is None or atr60 is None:
-                            logger.warning(f"[{strat}] ATR20/60 unavailable; skip valve recompute and keep baseline weights.")
-                            mask = pd.Series(False, index=ds.index)
-                        else:
-                            ratio = (atr20 / atr60).replace([np.inf, -np.inf], np.nan)
-                            mask = (ratio > float(atr_ratio))  # 觸發條件使用「> 門檻」。
-
-                    if force_trigger:
-                        mask[:] = True  # 強制全部日子套 CAP
-
-                    # 在全局壓 w 之前加：保存未套閥門的 baseline
-                    if "daily_state_base" not in result and ds_raw is not None:
-                        result["daily_state_base"] = ds_raw  # 保存未套閥門的 baseline
-
-                    # ➋ 追加以下兩行（放在同一段、覆寫 w 之前）
-                    if "trade_ledger_base" not in result and result.get("trade_ledger") is not None:
-                        result["trade_ledger_base"] = result["trade_ledger"]
-                    if "weight_curve_base" not in result and result.get("weight_curve") is not None:
-                        result["weight_curve_base"] = result["weight_curve"]
-
-                    # 3) 對齊到 ds.index，逐日壓 w 至 CAP
-                    mask_aligned = mask.reindex(ds.index).fillna(False).to_numpy()
-                    w = ds["w"].astype(float).to_numpy()
-                    w_new = w.copy()
-                    w_new[mask_aligned] = np.minimum(w_new[mask_aligned], float(risk_cap))
-                    ds["w"] = w_new
-
-                    # 4) 回寫 ds，並重算交易/權益
-                    result["daily_state_std"] = pack_df(ds)
-
-                    # open 價（沒有 open 就退而求其次用收盤價）
-                    open_px = (df_raw["open"] if "open" in df_raw.columns else df_raw.get("收盤價")).astype(float)
-                    open_px = open_px.reindex(ds.index).dropna()
-
-                    # 若你沿用現有的 risk_valve_backtest，給 cap_level=1.0 表示「w 已經是目標序列」
-                    try:
-                        from SSS_EnsembleTab import (
-                            risk_valve_backtest,
-                            CostParams,
-                            _mdd_from_daily_equity,
-                            _sell_returns_pct_from_ledger,
-                        )
-
-                        # 成本參數
-                        trade_cost = (strat_params.get("trade_cost", {})
-                                      if isinstance(strat_params, dict) else {})
-                        cost = CostParams(
-                            buy_fee_bp=float(trade_cost.get("buy_fee_bp", 4.27)),
-                            sell_fee_bp=float(trade_cost.get("sell_fee_bp", 4.27)),
-                            sell_tax_bp=float(trade_cost.get("sell_tax_bp", 30.0)),
-                        )
-
-                        # 基準（有高低價就帶上）
-                        bench = _build_benchmark_df(df_raw)
-
-                        # === 風險閥門回測：確保參數一致性 (2025/08/20) ===
-                        valve_params = {
-                            "open_px": open_px,
-                            "w": ds["w"].astype(float).reindex(open_px.index).fillna(0.0),
-                            "cost": cost,
-                            "benchmark_df": bench,
-                            "mode": "cap",
-                            "cap_level": float(risk_cap),  # 使用實際的風險上限值
-                            "slope20_thresh": 0.0,         # 👈 與進階分析一致：20日斜率門檻
-                            "slope60_thresh": 0.0,         # 👈 與進階分析一致：60日斜率門檻
-                            "atr_win": 20,
-                            "atr_ref_win": 60,
-                            "atr_ratio_mult": float(atr_ratio),   # 👈 與全局一致
-                            "use_slopes": True,            # 👈 與進階分析一致：啟用斜率條件
-                            "slope_method": "polyfit",     # 👈 與進階分析一致：使用多項式擬合
-                            "atr_cmp": "gt"               # 👈 與進階分析一致：使用 ">" 比較符號
-                        }
-
-                        # 記錄風險閥門配置用於診斷
-                        logger.info(f"[{strat}] 風險閥門配置: cap_level={valve_params['cap_level']}, atr_ratio_mult={valve_params['atr_ratio_mult']}")
-
-                        result_cap = risk_valve_backtest(**valve_params)
-                    except Exception as e:
-                        logger.warning(f"[{strat}] 無法導入 risk_valve_backtest: {e}")
-                        result_cap = None
-
-                    if result_cap:
-                        # === 安全覆寫：清掉舊鍵並補齊新鍵 ===
-                        logger.info(f"[UI_CHECK] 即將覆寫：new_trades={len(result_cap.get('trade_ledger_valve', pd.DataFrame()))} rows, new_ds={len(result_cap.get('daily_state_valve', pd.DataFrame()))} rows")
-
-                        # app_dash.py / 2025-08-22 15:30
-                        # 全局風險閥門：同時保存 baseline 與 valve 版本，不覆寫標準鍵
-                        # 1) 保存 valve 版本到專用鍵
-                        if 'trade_ledger_valve' in result_cap:
-                            result['trade_ledger_valve'] = pack_df(result_cap['trade_ledger_valve'])
-
-                        if 'daily_state_valve' in result_cap:
-                            result['daily_state_valve'] = pack_df(result_cap['daily_state_valve'])
-
-                        if 'weights_valve' in result_cap:
-                            result['weight_curve_valve'] = pack_series(result_cap['weights_valve'])
-
-                        # 權益曲線：若是 Series
-                        if 'daily_state_valve' in result_cap and 'equity' in result_cap['daily_state_valve']:
-                            try:
-                                result['equity_curve_valve'] = pack_series(result_cap['daily_state_valve']['equity'])
-                            except Exception:
-                                # 若你存的是 DataFrame
-                                result['equity_curve_valve'] = pack_df(result_cap['daily_state_valve']['equity'].to_frame('equity'))
-
-                        # 2) 保存 baseline 版本到專用鍵（如果還沒有）
-                        if "daily_state_base" not in result and result.get("daily_state") is not None:
-                            result["daily_state_base"] = result["daily_state"]
-                        if "trade_ledger_base" not in result and result.get("trade_ledger") is not None:
-                            result["trade_ledger_base"] = result["trade_ledger"]
-                        if "weight_curve_base" not in result and result.get("weight_curve") is not None:
-                            result["weight_curve_base"] = result["weight_curve"]
-
-                        # 3) 清掉可能造成混淆的舊快取
-                        for k in ['trades_ui', 'trade_df', 'trade_ledger_std', 'metrics']:
-                            if k in result:
-                                result.pop(k, None)
-
-
-
-                        # 新增：標記 valve 狀態供後續快取判斷
-                        result['valve'] = {
-                            'applied': True,
-                            'cap': float(risk_cap),
-                            'atr_ratio_mult': float(atr_ratio),
-                        }
-
-                        # 新增：存入 ensemble 參數（若可取得）
-                        # 在全局風險閥門區塊中，我們沒有 cfg 物件，直接使用預設值
-                        result["ensemble_params"] = {"majority_k_pct": 0.55}  # 預設值
-
-                        # 2025-08-20 重算指標以保留績效資訊 #app_dash.py
-                        ledger_valve = result_cap.get('trade_ledger_valve', pd.DataFrame())
-                        ds_valve = result_cap.get('daily_state_valve', pd.DataFrame())
-                        if not ledger_valve.empty and not ds_valve.empty and 'equity' in ds_valve:
-                            r = _sell_returns_pct_from_ledger(ledger_valve)
-                            eq = ds_valve['equity']
-                            total_ret = eq.iloc[-1] / eq.iloc[0] - 1
-                            years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1)
-                            ann_ret = (1 + total_ret) ** (1 / years) - 1
-                            mdd = _mdd_from_daily_equity(eq)
-                            dd = eq / eq.cummax() - 1
-                            blocks = (~(dd < 0)).cumsum()
-                            dd_dur = int((dd.groupby(blocks).cumcount() + 1).where(dd < 0).max() or 0)
-                            num_trades = len(r)
-                            win_rate = (r > 0).sum() / num_trades if num_trades > 0 else 0
-                            avg_win = r[r > 0].mean() if win_rate > 0 else np.nan
-                            avg_loss = r[r < 0].mean() if win_rate < 1 else np.nan
-                            payoff = abs(avg_win / avg_loss) if avg_loss != 0 and not np.isnan(avg_win) else np.nan
-                            daily_r = eq.pct_change().dropna()
-                            sharpe = (daily_r.mean() * np.sqrt(252)) / daily_r.std() if daily_r.std() != 0 else np.nan
-                            downside = daily_r[daily_r < 0]
-                            sortino = (daily_r.mean() * np.sqrt(252)) / downside.std() if downside.std() != 0 else np.nan
-                            ann_vol = daily_r.std() * np.sqrt(252) if len(daily_r) > 0 else np.nan
-                            prof = r[r > 0].sum()
-                            loss = abs(r[r < 0].sum())
-                            pf = prof / loss if loss != 0 else np.nan
-                            win_flag = r > 0
-                            grp = (win_flag != win_flag.shift()).cumsum()
-                            consec = win_flag.groupby(grp).cumcount() + 1
-                            max_wins = int(consec[win_flag].max() if True in win_flag.values else 0)
-                            max_losses = int(consec[~win_flag].max() if False in win_flag.values else 0)
-                            result['metrics'] = {
-                                'total_return': float(total_ret),
-                                'annual_return': float(ann_ret),
-                                'max_drawdown': float(mdd),
-                                'max_drawdown_duration': dd_dur,
-                                'calmar_ratio': float(ann_ret / abs(mdd)) if mdd < 0 else np.nan,
-                                'num_trades': int(num_trades),
-                                'win_rate': float(win_rate),
-                                'avg_win': float(avg_win) if not np.isnan(avg_win) else np.nan,
-                                'avg_loss': float(avg_loss) if not np.isnan(avg_loss) else np.nan,
-                                'payoff_ratio': float(payoff) if not np.isnan(payoff) else np.nan,
-                                'sharpe_ratio': float(sharpe) if not np.isnan(sharpe) else np.nan,
-                                'sortino_ratio': float(sortino) if not np.isnan(sortino) else np.nan,
-                                'max_consecutive_wins': max_wins,
-                                'max_consecutive_losses': max_losses,
-                                'annualized_volatility': float(ann_vol) if not np.isnan(ann_vol) else np.nan,
-                                'profit_factor': float(pf) if not np.isnan(pf) else np.nan,
-                            }
-
-                        # 3) 給 UI 一個旗標與參數，便於顯示「已套用」
-                        result['_risk_valve_applied'] = True
-                        atr20_last = None
-                        atr60_last = None
-                        try:
-                            _atr20 = calculate_atr(df_raw, 20)
-                            _atr60 = calculate_atr(df_raw, 60)
-                            if _atr20 is not None and hasattr(_atr20, "dropna"):
-                                _atr20_valid = _atr20.dropna()
-                                if len(_atr20_valid) > 0:
-                                    atr20_last = float(_atr20_valid.iloc[-1])
-                            if _atr60 is not None and hasattr(_atr60, "dropna"):
-                                _atr60_valid = _atr60.dropna()
-                                if len(_atr60_valid) > 0:
-                                    atr60_last = float(_atr60_valid.iloc[-1])
-                        except Exception:
-                            pass
-
-                        result['_risk_valve_params'] = {
-                            'cap': float(risk_cap),
-                            'atr_ratio': float(atr_ratio),
-                            'atr20_last': atr20_last,
-                            'atr60_last': atr60_last,
-                        }
-
-                        true_days = int(mask_aligned.sum())
-                        logger.info(f"[{strat}] 全局風險閥門已套用（逐日），風險天數={true_days}, CAP={risk_cap:.2f}")
-                    else:
-                        logger.warning(f"[{strat}] 風險閥門重算沒有返回結果")
 
         # === Crash-only Overlay（可選）：在 baseline/valve 後再覆蓋一次 ===
         if crash_overlay_on:
@@ -5304,17 +4609,6 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
         enhanced_controls = html.Div([
             html.H4("🔍 增強分析"),
 
-            # === 新增：全局參數套用狀態提示 ===
-            html.Div([
-                html.Div(id="enhanced-global-status", style={
-                    "padding": "12px",
-                    "marginBottom": "16px",
-                    "borderRadius": "8px",
-                    "border": "1px solid #dee2e6",
-                    "backgroundColor": "#f8f9fa"
-                })
-            ]),
-
             # === 新增：從回測結果載入區塊 ===
             html.Details([
                 html.Summary("🧠 從回測結果載入"),
@@ -5363,7 +4657,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             html.Details([
                 html.Summary("🔍 數據比對與診斷"),
                 html.Div([
-                    html.Div("直接輸出實際數據進行比對，診斷全局套用與強化分析結果不同的問題",
+                    html.Div("直接輸出實際數據進行比對，診斷增強分析資料與參數一致性問題",
                              style={"marginBottom":"8px","fontSize":"14px","color":"#666"}),
                     html.Button("輸出數據比對報告", id="export-data-comparison", n_clicks=0,
                                style={"width":"100%","marginBottom":"8px","backgroundColor":"#17a2b8","color":"white"}),
@@ -5847,44 +5141,6 @@ def safe_startup():
     except Exception as e:
         print(f"啟動時數據下載失敗: {e}，繼續啟動應用")
 
-# --------- 增強分析 Callback：全局參數狀態更新 ---------
-@app.callback(
-    Output("enhanced-global-status", "children"),
-    [
-        Input("global-apply-switch", "value"),
-        Input("risk-cap-input", "value"),
-        Input("atr-ratio-threshold", "value"),
-        Input("force-valve-trigger", "value")
-    ]
-)
-def update_enhanced_global_status(global_apply, risk_cap, atr_ratio, force_trigger):
-    """更新增強分析頁面的全局參數套用狀態"""
-    if not global_apply:
-        return html.Div([
-            html.Small("🔴 全局參數套用未啟用", style={"color":"#dc3545","fontWeight":"bold","fontSize":"14px"}),
-            html.Br(),
-            html.Small("增強分析將使用頁面內建的參數設定", style={"color":"#666","fontSize":"12px"}),
-            html.Br(),
-            html.Small("💡 如需使用全局設定，請在側邊欄啟用「啟用全局參數套用」", style={"color":"#666","fontSize":"11px","fontStyle":"italic"})
-        ])
-
-    # 如果啟用全局參數套用
-    status_color = "#28a745" if not force_trigger else "#dc3545"
-    status_icon = "🟢" if not force_trigger else "🔴"
-    status_text = "正常" if not force_trigger else "強制觸發"
-
-    return html.Div([
-        html.Small(f"{status_icon} 全局參數套用已啟用", style={"color":status_color,"fontWeight":"bold","fontSize":"14px"}),
-        html.Br(),
-        html.Small(f"風險閥門 CAP: {risk_cap}", style={"color":"#666","fontSize":"12px"}),
-        html.Br(),
-        html.Small(f"ATR比值門檻: {atr_ratio}", style={"color":"#666","fontSize":"12px"}),
-        html.Br(),
-        html.Small(f"狀態: {status_text}", style={"color":status_color,"fontSize":"12px"}),
-        html.Br(),
-        html.Small("💡 增強分析的風險閥門回測將優先使用這些全局設定", style={"color":"#28a745","fontSize":"11px","fontStyle":"italic"})
-    ])
-
 # --------- 增強分析 Callback：風險閥門回測（整合版） ---------
 @app.callback(
     Output("rv-summary","children"),
@@ -5895,83 +5151,31 @@ def update_enhanced_global_status(global_apply, risk_cap, atr_ratio, force_trigg
     State("rv-cap","value"),
     State("rv-atr-mult","value"),
     State("enhanced-trades-cache","data"),
-    # === 新增：讀取全局參數設定 ===
-    State("global-apply-switch","value"),
-    State("risk-cap-input","value"),
-    State("atr-ratio-threshold","value"),
-    # === 新增：讀取全局套用數據源 ===
     State("backtest-store","data"),
     prevent_initial_call=True
 )
-def _run_rv(n_clicks, mode, cap_level, atr_mult, cache, global_apply, global_risk_cap, global_atr_ratio, backtest_data=None):
+def _run_rv(n_clicks, mode, cap_level, atr_mult, cache, backtest_data=None):
     if not n_clicks or not cache:
         return "請先載入策略資料", no_update, no_update
 
-    # === 修正：優先使用全局參數設定 ===
-    if global_apply:
-        # 如果啟用全局參數套用，優先使用全局設定
-        effective_cap = global_risk_cap if global_risk_cap is not None else cap_level
-        effective_atr_ratio = global_atr_ratio if global_atr_ratio is not None else atr_mult
-        logger.info(f"增強分析使用全局參數：CAP={effective_cap}, ATR比值門檻={effective_atr_ratio}")
+    # 全局風險閥門已移除：增強分析只使用頁面參數。
+    effective_cap = cap_level
+    effective_atr_ratio = atr_mult
+    logger.info(f"增強分析使用頁面參數：CAP={effective_cap}, ATR比值門檻={effective_atr_ratio}")
 
-        # === 新增：詳細的參數對比日誌 ===
-        logger.info(f"=== 增強分析參數對比 ===")
-        logger.info(f"全局設定：CAP={global_risk_cap}, ATR比值門檻={global_atr_ratio}")
-        logger.info(f"頁面設定：CAP={cap_level}, ATR比值門檻={atr_mult}")
-        logger.info(f"最終使用：CAP={effective_cap}, ATR比值門檻={effective_atr_ratio}")
-
-    else:
-        # 否則使用增強分析頁面的設定
-        effective_cap = cap_level
-        effective_atr_ratio = atr_mult
-        logger.info(f"增強分析使用頁面參數：CAP={effective_cap}, ATR比值門檻={effective_atr_ratio}")
-
-    # === 整合：使用與全局套用相同的數據源 ===
     logger.info(f"=== 數據驗證 ===")
 
-    # 優先使用全局套用的數據源，確保一致性
-    if global_apply and backtest_data:
-        # 從 backtest-store 獲取數據，與全局套用保持一致
+    # 以 enhanced cache 為主，必要時回退到 backtest-store。
+    df_raw = df_from_pack(cache.get("df_raw"))
+    daily_state = df_from_pack(cache.get("daily_state"))
+    if (df_raw is None or df_raw.empty or daily_state is None or daily_state.empty) and backtest_data:
         results = backtest_data.get("results", {})
-        if results:
-            # 找到對應的策略結果
-            strategy_name = cache.get("strategy") if cache else None
-            if strategy_name and strategy_name in results:
-                result = results[strategy_name]
-                df_raw = df_from_pack(backtest_data.get("df_raw"))
-                daily_state = df_from_pack(result.get("daily_state_std") or result.get("daily_state"))
-                logger.info(f"使用全局套用數據源: {strategy_name}")
-            else:
-                # 回退到快取數據
-                df_raw = df_from_pack(cache.get("df_raw"))
-                daily_state = df_from_pack(cache.get("daily_state"))
-                logger.info("回退到快取數據源")
-        else:
-            # 回退到快取數據
-            df_raw = df_from_pack(cache.get("df_raw"))
-            daily_state = df_from_pack(cache.get("daily_state"))
-            logger.info("回退到快取數據源")
-    else:
-        # 使用快取數據
-        df_raw = df_from_pack(cache.get("df_raw"))
-        daily_state = df_from_pack(cache.get("daily_state"))
-        logger.info("使用快取數據源")
-
-    # === 新增：數據一致性檢查 ===
-    if global_apply and backtest_data:
-        logger.info("=== 數據一致性檢查 ===")
-        # 檢查與全局套用數據的一致性
-        global_df_raw = df_from_pack(backtest_data.get("df_raw"))
-        if global_df_raw is not None and df_raw is not None:
-            if len(global_df_raw) == len(df_raw):
-                logger.info(f"✅ 數據長度一致: {len(df_raw)}")
-            else:
-                logger.warning(f"⚠️  數據長度不一致: 全局={len(global_df_raw)}, 增強分析={len(df_raw)}")
-
-        if daily_state is not None:
-            logger.info(f"✅ daily_state 載入成功: {len(daily_state)} 行")
-        else:
-            logger.warning("⚠️  daily_state 載入失敗")
+        strategy_name = cache.get("strategy") if cache else None
+        if strategy_name and strategy_name in results:
+            result = results[strategy_name]
+            df_raw = df_from_pack(backtest_data.get("df_raw"))
+            daily_state = df_from_pack(result.get("daily_state_std") or result.get("daily_state"))
+            logger.info(f"回退使用 backtest-store 資料源: {strategy_name}")
 
     # === 原有數據驗證日誌 ===
     logger.info(f"df_raw 形狀: {df_raw.shape if df_raw is not None else 'None'}")
@@ -6058,7 +5262,7 @@ def _run_rv(n_clicks, mode, cap_level, atr_mult, cache, global_apply, global_ris
         html.Code(f"右尾總和(>P90 正報酬): 原始 {m['right_tail_sum_orig']:.2f} → 閥門 {m['right_tail_sum_valve']:.2f} (↓{m['right_tail_reduction']:.2f})"), html.Br(),
         html.Code(f"風險觸發天數：{trigger_days} 天"), html.Br(),
         html.Code(f"使用參數：CAP={effective_cap}, ATR比值門檻={effective_atr_ratio}"), html.Br(),
-        html.Code(f"參數來源：{'全局設定' if global_apply else '頁面設定'}", style={"color": "#28a745" if global_apply else "#ffc107"})
+        html.Code("參數來源：頁面設定", style={"color": "#ffc107"})
     ])
 
     # 繪圖：兩版權益與回撤
@@ -6108,33 +5312,23 @@ def _run_rv(n_clicks, mode, cap_level, atr_mult, cache, global_apply, global_ris
     Input("export-data-comparison", "n_clicks"),
     State("enhanced-trades-cache", "data"),
     State("backtest-store", "data"),
-    State("global-apply-switch", "value"),
-    State("risk-cap-input", "value"),
-    State("atr-ratio-threshold", "value"),
     State("rv-cap", "value"),
     State("rv-atr-mult", "value"),
     prevent_initial_call=True
 )
-def generate_data_comparison_report(n_clicks, cache, backtest_data, global_apply, global_cap, global_atr, page_cap, page_atr):
-    """生成數據比對報告，診斷全局套用與強化分析結果不同的問題 - 增強版 (2025/08/20)"""
+def generate_data_comparison_report(n_clicks, cache, backtest_data, page_cap, page_atr):
+    """生成數據比對報告，檢查增強分析資料完整性與當前參數。"""
     if not n_clicks:
         return "請點擊按鈕生成報告", no_update
 
     logger.info(f"=== 生成增強數據比對報告 ===")
 
-    # 收集參數資訊
+    # 收集參數資訊（僅頁面參數）
     param_info = {
-        "全局參數套用": "啟用" if global_apply else "未啟用",
-        "全局風險閥門CAP": global_cap,
-        "全局ATR比值門檻": global_atr,
         "頁面風險閥門CAP": page_cap,
         "頁面ATR比值門檻": page_atr,
-        "最終使用CAP": global_cap if global_apply else page_cap,
-        "最終使用ATR比值門檻": global_atr if global_apply else page_atr,
-        "參數差異分析": "CAP差異={}, ATR差異={}".format(
-            abs((global_cap or 0) - (page_cap or 0)),
-            abs((global_atr or 0) - (page_atr or 0))
-        )
+        "最終使用CAP": page_cap,
+        "最終使用ATR比值門檻": page_atr,
     }
 
     # 收集數據資訊
@@ -6208,21 +5402,10 @@ def generate_data_comparison_report(n_clicks, cache, backtest_data, global_apply
             report_lines.append(f"    {key}: {value}")
         report_lines.append("")
 
-    # 增強診斷建議 (2025/08/20)
+    # 增強診斷建議
     report_lines.append("🔍 詳細診斷建議:")
 
-    # 參數一致性檢查
-    if global_apply:
-        cap_diff = abs((global_cap or 0) - (page_cap or 0))
-        atr_diff = abs((global_atr or 0) - (page_atr or 0))
-        if cap_diff > 0.001 or atr_diff > 0.001:
-            report_lines.append(f"  ⚠️  全局與頁面參數差異: CAP差異={cap_diff:.4f}, ATR差異={atr_diff:.4f}")
-            report_lines.append("      → 建議檢查 UI 介面的參數同步機制")
-        else:
-            report_lines.append("  ✅ 全局參數與頁面參數一致")
-    else:
-        report_lines.append("  ℹ️  未啟用全局參數套用，使用頁面參數")
-        report_lines.append("      → 確認是否需要啟用全局套用以保持一致性")
+    report_lines.append("  ℹ️  全局風險閥門已移除，增強分析僅使用頁面參數")
 
     # 數據完整性檢查
     enhanced_has_data = "enhanced_cache" in data_info and data_info["enhanced_cache"]["daily_state_shape"]
@@ -6244,8 +5427,8 @@ def generate_data_comparison_report(n_clicks, cache, backtest_data, global_apply
         report_lines.append("      → 可能需要重新執行回測分析")
 
     # 風險閥門邏輯檢查
-    effective_cap = global_cap if global_apply else page_cap
-    effective_atr = global_atr if global_apply else page_atr
+    effective_cap = page_cap
+    effective_atr = page_atr
 
     report_lines.append("  🔧 風險閥門配置:")
     report_lines.append(f"      有效CAP值: {effective_cap}")
@@ -6258,8 +5441,6 @@ def generate_data_comparison_report(n_clicks, cache, backtest_data, global_apply
 
     # 一致性檢查總結
     consistency_issues = []
-    if global_apply and (cap_diff > 0.001 or atr_diff > 0.001):
-        consistency_issues.append("參數不一致")
     if not enhanced_has_data:
         consistency_issues.append("Enhanced Cache缺失")
     if not backtest_has_data:
@@ -7254,11 +6435,11 @@ def _auto_cache_best_strategy(bstore, current_selection):
     State("enhanced-trades-cache", "data"),
     State("backtest-store", "data"),
     State("rv-mode", "value"),
-    State("risk-cap-input", "value"),
-    State("atr-ratio-threshold", "value"),
+    State("rv-cap", "value"),
+    State("rv-atr-mult", "value"),
     prevent_initial_call=True
 )
-def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value, atr_ratio_value):
+def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, rv_cap_value, rv_atr_value):
     """生成風險-報酬地圖（Pareto Map）：掃描 cap 與 ATR(20)/ATR(60) 比值全組合"""
     logger.info(f"=== Pareto Map 生成開始 ===")
     logger.info(f"n_clicks: {n_clicks}")
@@ -7381,18 +6562,18 @@ def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value,
     import numpy as np
 
     # 讀取當前設定
-    cap_now = float(risk_cap_value) if risk_cap_value else 0.8
-    atr_now = float(atr_ratio_value) if atr_ratio_value else 1.2
+    cap_now = float(rv_cap_value) if rv_cap_value else 0.8
+    atr_now = float(rv_atr_value) if rv_atr_value else 1.2
 
     # 基本格點
     caps = np.round(np.linspace(0.10, 1.00, 19), 2)
     atr_mults = np.round(np.linspace(1.00, 2.00, 21), 2)
 
     # 將全局設定植入格點（避免被內插忽略）
-    if risk_cap_value is not None:
-        caps = np.unique(np.r_[caps, float(risk_cap_value)])
-    if atr_ratio_value is not None:
-        atr_mults = np.unique(np.r_[atr_mults, float(atr_ratio_value)])
+    if rv_cap_value is not None:
+        caps = np.unique(np.r_[caps, float(rv_cap_value)])
+    if rv_atr_value is not None:
+        atr_mults = np.unique(np.r_[atr_mults, float(rv_atr_value)])
 
     logger.info(f"當前設定: cap={cap_now:.2f}, atr={atr_now:.2f}")
     logger.info(f"cap 範圍: {len(caps)} 個值，從 {caps[0]} 到 {caps[-1]}")
@@ -7533,12 +6714,12 @@ def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value,
                 name="Current Settings"
             ))
 
-    # 加入「Global」標記點（全局門檻設定）
-    if risk_cap_value is not None and atr_ratio_value is not None:
+    # 加入「Current」標記點（頁面門檻設定）
+    if rv_cap_value is not None and rv_atr_value is not None:
         # 嘗試找到對應的掃描結果點位
-        global_cap = float(risk_cap_value)
-        global_atr = float(atr_ratio_value)
-        global_point = dfp[(dfp['cap'] == global_cap) & (dfp['atr'] == global_atr)]
+        current_cap = float(rv_cap_value)
+        current_atr = float(rv_atr_value)
+        global_point = dfp[(dfp['cap'] == current_cap) & (dfp['atr'] == current_atr)]
 
         if not global_point.empty:
             fig.add_trace(go.Scatter(
@@ -7551,14 +6732,14 @@ def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value,
                     color='blue',
                     line=dict(color='white', width=2)
                 ),
-                text=f"Global: cap={global_cap:.2f}, atr={global_atr:.2f}",
+                text=f"Current: cap={current_cap:.2f}, atr={current_atr:.2f}",
                 hovertemplate=(
                     "<b>%{text}</b><br>" +
                     "MDD: %{x:.2%}<br>" +
                     "PF: %{y:.2f}<br>" +
                     "<extra></extra>"
                 ),
-                name="Global Setting"
+                name="Current Setting"
             ))
 
     fig.update_layout(
@@ -7577,7 +6758,7 @@ def generate_pareto_map(n_clicks, cache, backtest_data, rv_mode, risk_cap_value,
         margin=dict(r=120)
     )
 
-    status_msg = f"✅ 成功生成：掃描 cap×ATR 比值 {succeeded}/{tried} 組。顏色=右尾調整幅度（紅=削減，藍=放大），大小=風險觸發天數。目前全局設定：cap={cap_now:.2f}, atr={atr_now:.2f}。資料來源：{data_source}"
+    status_msg = f"✅ 成功生成：掃描 cap×ATR 比值 {succeeded}/{tried} 組。顏色=右尾調整幅度（紅=削減，藍=放大），大小=風險觸發天數。目前頁面設定：cap={cap_now:.2f}, atr={atr_now:.2f}。資料來源：{data_source}"
     return fig, status_msg
 
 # --------- 每日訊號：param_presets real/experiment 引擎 ---------

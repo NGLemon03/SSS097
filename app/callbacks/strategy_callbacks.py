@@ -9,7 +9,6 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
         [
             Input("run-btn", "n_clicks"),
             Input("auto-run", "value"),
-            Input("price-update-store", "data"),
             Input("hide-strategy-presets", "value"),
             Input("ticker-dropdown", "value"),
             Input("start-date", "value"),
@@ -17,10 +16,8 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
             Input("discount-slider", "value"),
             Input("cooldown-bars", "value"),
             Input("bad-holding", "value"),
-            Input("global-apply-switch", "value"),
-            Input("risk-cap-input", "value"),
-            Input("atr-ratio-threshold", "value"),
-            Input("force-valve-trigger", "value"),
+            Input("crash-overlay-switch", "value"),
+            Input("crash-overlay-preset", "value"),
             Input("warehouse-dropdown", "value"),
             Input("majority-floor", "value"),
             Input("majority-ema-span", "value"),
@@ -38,7 +35,6 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
     def _run_backtest_callback(
         n_clicks,
         auto_run,
-        price_update,
         hidden_strategy_presets,
         ticker,
         start_date,
@@ -46,10 +42,8 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
         discount,
         cooldown,
         bad_holding,
-        global_apply,
-        risk_cap,
-        atr_ratio,
-        force_trigger,
+        crash_overlay_on,
+        crash_overlay_preset,
         warehouse_file,
         maj_floor,
         maj_ema,
@@ -66,7 +60,6 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
         return run_backtest_func(
             n_clicks,
             auto_run,
-            price_update,
             hidden_strategy_presets,
             ticker,
             start_date,
@@ -74,10 +67,8 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
             discount,
             cooldown,
             bad_holding,
-            global_apply,
-            risk_cap,
-            atr_ratio,
-            force_trigger,
+            crash_overlay_on,
+            crash_overlay_preset,
             warehouse_file,
             maj_floor,
             maj_ema,
@@ -98,6 +89,8 @@ def register_strategy_callbacks(app, *, run_backtest_func, update_tab_func) -> N
         Input("main-tabs", "value"),
         Input("theme-store", "data"),
         Input("smart-leverage-switch", "value"),
+        Input("hide-strategy-presets", "value"),
+        Input("ticker-dropdown", "value"),
     )
-    def _update_tab_callback(data, tab, theme, smart_leverage_on):
-        return update_tab_func(data, tab, theme, smart_leverage_on)
+    def _update_tab_callback(data, tab, theme, smart_leverage_on, hidden_strategy_presets, ticker_for_daily):
+        return update_tab_func(data, tab, theme, smart_leverage_on, hidden_strategy_presets, ticker_for_daily)
