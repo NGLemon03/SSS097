@@ -3,6 +3,7 @@ from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import json
 import io
 from dash.dependencies import ALL
@@ -17,6 +18,8 @@ from analysis.daily_param_signals import build_daily_signal_context, run_daily_p
 import yfinance as yf
 import logging
 import numpy as np
+import re
+import sqlite3
 from urllib.parse import quote as urlparse
 from typing import Any, Dict, Optional
 try:
@@ -32,6 +35,8 @@ os.environ["SSS_CREATE_LOGS"] = "1"
 
 # 獲取日誌器（懶加載）
 logger = get_logger("SSS.App")
+ENABLE_CASH_ONLY_XRAY_SUBPLOTS = os.environ.get("SSS_DASH_CASH_ONLY_XRAY", "0") == "1"
+DISABLE_SMAA_RAW_HIGHLIGHT = os.environ.get("SSS_DASH_DISABLE_SMAA_HIGHLIGHT", "0") == "1"
 
 def normalize_daily_state_columns(ds: pd.DataFrame) -> pd.DataFrame:
     """將不同來源的 daily_state 欄位語意統一：
@@ -1268,6 +1273,7 @@ def _pack_result_for_store(result: dict) -> dict:
         'daily_state_std', 'trade_ledger_std',
         'weight_curve',
         'indicator_daily',
+        'crash_debug_df', 'crash_state',
         # ➊ 新增：保存未套閥門 baseline
         'daily_state_base', 'trade_ledger_base', 'weight_curve_base',
         # ➋ 新增：保存 valve 版本
@@ -1355,6 +1361,756 @@ def _ensure_exposure_metrics(metrics: dict, result: dict, daily_state_hint: pd.D
     if not _is_valid_number(metrics.get("turnover_py")):
         metrics["turnover_py"] = float(w.diff().abs().fillna(0.0).sum() / max(len(w), 1) * 252.0)
 
+
+def _parse_count_and_limit(raw: Any) -> tuple[float, float]:
+    if raw is None:
+        return np.nan, np.nan
+    nums = re.findall(r"[-+]?\d[\d,]*", str(raw))
+    if not nums:
+        return np.nan, np.nan
+    count = float(nums[0].replace(",", ""))
+    limit_count = float(nums[1].replace(",", "")) if len(nums) >= 2 else np.nan
+    return count, limit_count
+
+
+def _extract_twse_breadth_counts(raw_json: Any) -> tuple[float, float, float, float]:
+    """Extract up/down and limit-up/limit-down counts from mi_index payload."""
+    if not isinstance(raw_json, str) or not raw_json:
+        return np.nan, np.nan, np.nan, np.nan
+    try:
+        obj = json.loads(raw_json)
+    except Exception:
+        return np.nan, np.nan, np.nan, np.nan
+
+    for table in obj.get("tables", []):
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("data", [])
+        fields = table.get("fields", [])
+        if not isinstance(rows, list) or len(rows) < 2:
+            continue
+        if not isinstance(fields, list) or len(fields) < 2:
+            continue
+        row0 = rows[0] if isinstance(rows[0], list) else []
+        row1 = rows[1] if isinstance(rows[1], list) else []
+        if len(row0) < 2 or len(row1) < 2:
+            continue
+        if "(" not in str(row0[1]) or "(" not in str(row1[1]):
+            continue
+
+        up, up_limit = _parse_count_and_limit(row0[1])
+        down, down_limit = _parse_count_and_limit(row1[1])
+        if np.isfinite(up) and np.isfinite(down):
+            return up, down, up_limit, down_limit
+    return np.nan, np.nan, np.nan, np.nan
+
+
+def _build_twse_market_features(db_path: str = "twse_data.db") -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    try:
+        fmt = pd.read_sql_query("SELECT date, trade_value, taiex, change FROM fmtqik", conn)
+        mi = pd.read_sql_query("SELECT date, has_data, raw_json FROM mi_index WHERE has_data=1", conn)
+    finally:
+        conn.close()
+
+    for col in ["trade_value", "taiex", "change"]:
+        fmt[col] = pd.to_numeric(fmt[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    fmt["date"] = pd.to_datetime(fmt["date"], errors="coerce")
+    fmt = fmt.dropna(subset=["date"]).set_index("date").sort_index()
+
+    rows: list[tuple[pd.Timestamp, float, float, float, float]] = []
+    for _, rec in mi.iterrows():
+        dt = pd.to_datetime(rec.get("date"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        up, down, up_limit, down_limit = _extract_twse_breadth_counts(rec.get("raw_json"))
+        rows.append((dt, up, down, up_limit, down_limit))
+
+    breadth = pd.DataFrame(
+        rows,
+        columns=["date", "up", "down", "up_limit", "down_limit"],
+    ).set_index("date").sort_index()
+    breadth["breadth"] = (breadth["up"] - breadth["down"]) / (breadth["up"] + breadth["down"])
+    breadth["limit_net"] = (breadth["up_limit"] - breadth["down_limit"]) / (
+        breadth["up_limit"] + breadth["down_limit"]
+    )
+
+    mk = fmt.join(breadth[["breadth", "limit_net"]], how="left")
+    mk["breadth"] = mk["breadth"].ffill()
+    mk["limit_net"] = mk["limit_net"].ffill()
+    prev = mk["taiex"] - mk["change"]
+    mk["chg_pct"] = mk["change"] / prev.replace(0.0, np.nan)
+
+    for n in [20, 40, 60, 120]:
+        mk[f"ma{n}"] = mk["taiex"].rolling(n, min_periods=max(10, n // 2)).mean()
+    for n in [10, 20, 40, 60]:
+        mk[f"tv{n}"] = mk["trade_value"].rolling(n, min_periods=max(5, n // 2)).mean()
+    return mk
+
+
+def _build_crash_overlay_state(
+    index: pd.Index,
+    market_df: pd.DataFrame,
+    params: dict[str, Any],
+) -> tuple[pd.Series, pd.DataFrame]:
+    idx = pd.DatetimeIndex(pd.to_datetime(index, errors="coerce"))
+    idx = idx[~idx.isna()]
+    if len(idx) == 0:
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    mk = market_df.copy()
+    mk.index = pd.to_datetime(mk.index, errors="coerce")
+    mk = mk[mk.index.notna()].sort_index()
+    if mk.empty:
+        return pd.Series(dtype=float), pd.DataFrame()
+
+    ma_win = int(params.get("ma", 20))
+    dd_win = int(params.get("dd_win", 250))
+    tv_win = int(params.get("tv_win", 10))
+    dd_th = float(params.get("dd_th", -0.10))
+    day_drop_th = float(params.get("day_drop_th", -0.03))
+    breadth_th = float(params.get("breadth_th", -0.30))
+    limit_net_th = float(params.get("limit_net_th", -0.20))
+    tv_ratio_th = float(params.get("tv_ratio_th", 1.2))
+    min_hits = int(params.get("min_hits", 3))
+    cap = float(params.get("cap", 0.1))
+    cooldown = int(params.get("cooldown", 5))
+    reentry_mode_raw = str(params.get("reentry_mode", "time_only") or "time_only").strip().lower()
+    reentry_mode = reentry_mode_raw if reentry_mode_raw in {"time_only", "crash_off_2d", "trend_or_crash_off2"} else "time_only"
+    reentry_min_hold = max(int(params.get("reentry_min_hold", 1) or 1), 1)
+
+    taiex = pd.to_numeric(mk.get("taiex"), errors="coerce").reindex(idx).ffill()
+    breadth = pd.to_numeric(mk.get("breadth"), errors="coerce").reindex(idx).ffill()
+    limit_net = pd.to_numeric(mk.get("limit_net"), errors="coerce").reindex(idx).ffill()
+    chg_pct = pd.to_numeric(mk.get("chg_pct"), errors="coerce").reindex(idx).ffill()
+    ma = pd.to_numeric(mk.get(f"ma{ma_win}"), errors="coerce").reindex(idx).ffill()
+    tv = pd.to_numeric(mk.get("trade_value"), errors="coerce").reindex(idx).ffill()
+    tv_ref = pd.to_numeric(mk.get(f"tv{tv_win}"), errors="coerce").reindex(idx).ffill()
+    tv_ratio = tv / tv_ref.replace(0.0, np.nan)
+
+    rolling_peak = taiex.rolling(dd_win, min_periods=max(20, dd_win // 3)).max()
+    drawdown = taiex / rolling_peak - 1.0
+
+    trend_down = taiex < ma
+    panic_day = chg_pct < day_drop_th
+    panic_breadth = breadth < breadth_th
+    panic_limit = limit_net < limit_net_th
+    panic_volume = tv_ratio > tv_ratio_th
+    panic_hits = (
+        panic_day.fillna(False).astype(int)
+        + panic_breadth.fillna(False).astype(int)
+        + panic_limit.fillna(False).astype(int)
+        + panic_volume.fillna(False).astype(int)
+    )
+    crash = (trend_down & (drawdown < dd_th) & (panic_hits >= min_hits)).fillna(False)
+    crash_off_2d = (~crash).rolling(2, min_periods=2).sum().ge(2).fillna(False)
+
+    state_pre_shift = pd.Series(1.0, index=idx, dtype=float)
+    remain = 0
+    held = 0
+    reentry_release = pd.Series(False, index=idx, dtype=bool)
+    for i in range(len(idx)):
+        if bool(crash.iloc[i]):
+            remain = cooldown
+            held = 0
+        if remain > 0:
+            held += 1
+            release = False
+            if reentry_mode != "time_only" and held >= reentry_min_hold:
+                is_trend_up = not bool(trend_down.iloc[i])
+                is_crash_off2 = bool(crash_off_2d.iloc[i])
+                if reentry_mode == "crash_off_2d":
+                    release = is_crash_off2
+                elif reentry_mode == "trend_or_crash_off2":
+                    release = is_trend_up or is_crash_off2
+
+            if release:
+                state_pre_shift.iloc[i] = 1.0
+                reentry_release.iloc[i] = True
+                remain = 0
+                held = 0
+            else:
+                state_pre_shift.iloc[i] = cap
+                remain -= 1
+        else:
+            state_pre_shift.iloc[i] = 1.0
+
+    # Next-bar execution to avoid look-ahead.
+    state = state_pre_shift.shift(1).ffill().fillna(1.0).clip(lower=min(cap, 1.0), upper=1.0)
+
+    debug_df = pd.DataFrame(
+        {
+            "state": state,
+            "state_pre_shift": state_pre_shift,
+            "taiex": taiex,
+            "ma": ma,
+            "drawdown": drawdown,
+            "trend_down": trend_down.fillna(False),
+            "breadth": breadth,
+            "limit_net": limit_net,
+            "chg_pct": chg_pct,
+            "tv_ratio": tv_ratio,
+            "panic_day": panic_day.fillna(False),
+            "panic_breadth": panic_breadth.fillna(False),
+            "panic_limit": panic_limit.fillna(False),
+            "panic_volume": panic_volume.fillna(False),
+            "panic_hits": panic_hits,
+            "crash_core": (trend_down & (drawdown < dd_th)).fillna(False),
+            "crash": crash,
+            "crash_off_2d": crash_off_2d,
+            "reentry_release": reentry_release,
+            "reentry_mode": reentry_mode,
+            "reentry_min_hold": int(reentry_min_hold),
+            "day_drop_th": float(day_drop_th),
+            "breadth_th": float(breadth_th),
+            "limit_net_th": float(limit_net_th),
+            "tv_ratio_th": float(tv_ratio_th),
+            "min_hits": int(min_hits),
+            "dd_th": float(dd_th),
+        },
+        index=idx,
+    )
+    return state, debug_df
+
+
+def _recompute_metrics_from_equity_and_trades(
+    equity: pd.Series,
+    trades_df: pd.DataFrame,
+    base_metrics: Optional[dict] = None,
+) -> dict:
+    metrics = dict(base_metrics or {})
+    if equity is None or len(equity) < 2:
+        return metrics
+
+    eq = pd.to_numeric(equity, errors="coerce").dropna()
+    if len(eq) < 2:
+        return metrics
+
+    total_ret = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1.0 / 252.0)
+    ann_ret = float((1.0 + total_ret) ** (1.0 / years) - 1.0) if (1.0 + total_ret) > 0 else np.nan
+    dd = eq / eq.cummax() - 1.0
+    mdd = float(dd.min()) if not dd.empty else np.nan
+
+    daily_ret = eq.pct_change().dropna()
+    vol = float(daily_ret.std() * np.sqrt(252.0)) if len(daily_ret) > 1 else np.nan
+    sharpe = float((daily_ret.mean() * np.sqrt(252.0)) / daily_ret.std()) if len(daily_ret) > 1 and daily_ret.std() > 0 else np.nan
+    downside = daily_ret[daily_ret < 0]
+    sortino = float((daily_ret.mean() * np.sqrt(252.0)) / downside.std()) if len(downside) > 1 and downside.std() > 0 else np.nan
+    calmar = float(ann_ret / abs(mdd)) if np.isfinite(ann_ret) and np.isfinite(mdd) and mdd < 0 else np.nan
+
+    sell_rets = pd.Series(dtype=float)
+    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+        t = trades_df.copy()
+        t.columns = [str(c).lower() for c in t.columns]
+        if "return" in t.columns:
+            ret_s = pd.to_numeric(t["return"], errors="coerce")
+        else:
+            ret_s = pd.Series(np.nan, index=t.index)
+        if "type" in t.columns:
+            sell_mask = t["type"].astype(str).str.lower().str.contains("sell|exit", na=False)
+            sell_rets = ret_s[sell_mask].dropna()
+        else:
+            sell_rets = ret_s.dropna()
+
+    num_trades = int(len(sell_rets))
+    win_rate = float((sell_rets > 0).mean()) if num_trades > 0 else np.nan
+    avg_win = float(sell_rets[sell_rets > 0].mean()) if (sell_rets > 0).any() else np.nan
+    avg_loss = float(sell_rets[sell_rets < 0].mean()) if (sell_rets < 0).any() else np.nan
+    payoff = float(abs(avg_win / avg_loss)) if np.isfinite(avg_win) and np.isfinite(avg_loss) and avg_loss != 0 else np.nan
+    profit_factor = float(sell_rets[sell_rets > 0].sum() / abs(sell_rets[sell_rets < 0].sum())) if (sell_rets < 0).any() else np.nan
+
+    metrics.update(
+        {
+            "total_return": total_ret,
+            "annual_return": ann_ret,
+            "max_drawdown": mdd,
+            "calmar_ratio": calmar,
+            "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
+            "annualized_volatility": vol,
+            "num_trades": num_trades,
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "payoff_ratio": payoff,
+            "profit_factor": profit_factor,
+        }
+    )
+    return metrics
+
+
+def _apply_crash_overlay_to_result(
+    result: dict,
+    df_raw: pd.DataFrame,
+    strat_params: dict,
+    ticker: str,
+    preset_name: str,
+    overlay_params: dict[str, Any],
+    market_df: Optional[pd.DataFrame] = None,
+) -> dict:
+    if not isinstance(result, dict):
+        return result
+    if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
+        return result
+
+    ds = _first_non_empty_result_df(
+        result,
+        ["daily_state_valve", "daily_state_std", "daily_state", "daily_state_base"],
+    )
+    if ds.empty or "w" not in ds.columns:
+        logger.warning("[CrashOverlay] 缺少 daily_state/w，略過")
+        return result
+
+    ds = ds.copy()
+    ds.index = pd.to_datetime(ds.index, errors="coerce")
+    ds = ds[ds.index.notna()].sort_index()
+    if ds.empty:
+        return result
+
+    mk = market_df
+    if mk is None:
+        db_path = str(overlay_params.get("db_path", "twse_data.db"))
+        if not os.path.exists(db_path):
+            logger.warning("[CrashOverlay] 找不到資料庫 %s，略過", db_path)
+            return result
+        try:
+            mk = _build_twse_market_features(db_path=db_path)
+        except Exception as exc:
+            logger.warning("[CrashOverlay] 讀取市場資料失敗: %s", exc)
+            return result
+    if mk is None or mk.empty:
+        return result
+
+    state, crash_debug_df = _build_crash_overlay_state(ds.index, mk, overlay_params)
+    if state.empty:
+        return result
+
+    common_idx = ds.index.intersection(state.index)
+    if len(common_idx) < 3:
+        return result
+
+    w_old = pd.to_numeric(ds.loc[common_idx, "w"], errors="coerce").fillna(0.0)
+    w_new = (w_old * state.reindex(common_idx).fillna(1.0)).clip(0.0, 1.0)
+    ds_valve = ds.loc[common_idx].copy()
+    ds_valve["w"] = w_new
+
+    if "daily_state_base" not in result and result.get("daily_state") is not None:
+        result["daily_state_base"] = result["daily_state"]
+    if "trade_ledger_base" not in result and result.get("trade_ledger") is not None:
+        result["trade_ledger_base"] = result["trade_ledger"]
+    if "weight_curve_base" not in result and result.get("weight_curve") is not None:
+        result["weight_curve_base"] = result["weight_curve"]
+
+    px_col = "open" if "open" in df_raw.columns else ("close" if "close" in df_raw.columns else None)
+    if px_col is None:
+        logger.warning("[CrashOverlay] df_raw 缺少 open/close，略過")
+        return result
+
+    open_px = pd.to_numeric(df_raw[px_col], errors="coerce")
+    open_px.index = pd.to_datetime(df_raw.index, errors="coerce")
+    open_px = open_px[open_px.index.notna()].sort_index()
+    open_px = open_px.reindex(common_idx).dropna()
+    if open_px.empty:
+        return result
+    w_eval = w_new.reindex(open_px.index).ffill().fillna(0.0)
+
+    try:
+        from SSS_EnsembleTab import CostParams, calculate_performance
+    except Exception as exc:
+        logger.warning("[CrashOverlay] 無法匯入回測函式: %s", exc)
+        return result
+
+    trade_cost = strat_params.get("trade_cost", {}) if isinstance(strat_params, dict) else {}
+    ticker_core = str(ticker or "").split(".")[0]
+    default_tax_bp = 10.0 if ticker_core.startswith("00") else 30.0
+    cost = CostParams(
+        buy_fee_bp=float(trade_cost.get("buy_fee_bp", 4.27)),
+        sell_fee_bp=float(trade_cost.get("sell_fee_bp", 4.27)),
+        sell_tax_bp=float(trade_cost.get("sell_tax_bp", default_tax_bp)),
+    )
+
+    eq, trades_df, ledger_df, _ = calculate_performance(open_px, w_eval, cost)
+    if ledger_df is None or ledger_df.empty:
+        return result
+
+    crash_debug_df = crash_debug_df.reindex(common_idx).copy() if isinstance(crash_debug_df, pd.DataFrame) else pd.DataFrame()
+    if not crash_debug_df.empty:
+        result["crash_debug_df"] = pack_df(crash_debug_df)
+    result["crash_state"] = pack_series(state.reindex(common_idx).fillna(1.0))
+
+    trades_out = trades_df.copy() if isinstance(trades_df, pd.DataFrame) else pd.DataFrame()
+    if not trades_out.empty:
+        trades_out.columns = [str(c).lower() for c in trades_out.columns]
+        if "trade_date" in trades_out.columns:
+            trades_out["trade_date"] = pd.to_datetime(trades_out["trade_date"], errors="coerce")
+        else:
+            trades_out["trade_date"] = pd.NaT
+        if "reason" not in trades_out.columns:
+            trades_out["reason"] = ""
+        trades_out["base_reason"] = trades_out["reason"].fillna("").astype(str)
+
+        w_base_eval = w_old.reindex(open_px.index).ffill().fillna(0.0)
+        delta_overlay = (w_eval - w_base_eval).fillna(0.0)
+        step_overlay = w_eval.diff().fillna(w_eval)
+        step_base = w_base_eval.diff().fillna(w_base_eval)
+        step_impact = (step_overlay - step_base).fillna(0.0)
+
+        step_map = {pd.Timestamp(k): float(v) for k, v in step_impact.items()}
+        level_map = {pd.Timestamp(k): float(v) for k, v in delta_overlay.items()}
+        trade_step = trades_out["trade_date"].map(step_map).fillna(0.0)
+        trade_level = trades_out["trade_date"].map(level_map).fillna(0.0)
+        crash_triggered = (trade_step.abs() > 1e-6) | (trade_level.abs() > 1e-6)
+        side = trades_out.get("type", pd.Series("", index=trades_out.index)).astype(str).str.lower()
+        crash_reason = pd.Series("", index=trades_out.index, dtype=object)
+        crash_reason.loc[crash_triggered & side.str.contains("buy|add|long", na=False)] = "crash_overlay_buy"
+        crash_reason.loc[crash_triggered & side.str.contains("sell|exit", na=False)] = "crash_overlay_sell"
+        crash_reason.loc[crash_triggered & (crash_reason == "")] = "crash_overlay_adjust"
+
+        trades_out["crash_triggered"] = crash_triggered
+        trades_out["crash_reason"] = crash_reason
+        overwrite_mask = crash_triggered & (crash_reason != "")
+        trades_out.loc[overwrite_mask, "reason"] = crash_reason.loc[overwrite_mask]
+        trades_df = trades_out
+
+    result["daily_state_valve"] = pack_df(ledger_df)
+    result["trade_ledger_valve"] = pack_df(trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame())
+    result["weight_curve_valve"] = pack_series(w_eval)
+    result["equity_curve_valve"] = pack_series(eq)
+    result["daily_state_std"] = pack_df(ledger_df)
+    result["trade_ledger_std"] = pack_df(trades_df if isinstance(trades_df, pd.DataFrame) else pd.DataFrame())
+
+    existing_metrics = result.get("metrics", {})
+    result["metrics"] = _recompute_metrics_from_equity_and_trades(eq, trades_df, existing_metrics)
+    result["_risk_valve_applied"] = True
+
+    trigger_days = int((state.reindex(common_idx).fillna(1.0) < 0.999).sum())
+    trigger_rate = float(trigger_days / max(len(common_idx), 1))
+    result["valve"] = {
+        "applied": True,
+        "mode": "crash_only",
+        "preset": preset_name,
+        "cap": float(overlay_params.get("cap", np.nan)),
+        "reentry_mode": str(overlay_params.get("reentry_mode", "time_only")),
+        "reentry_min_hold": int(overlay_params.get("reentry_min_hold", 1) or 1),
+        "trigger_days": trigger_days,
+        "trigger_rate": trigger_rate,
+        "atr_ratio": "crash_only",
+    }
+    result["crash_overlay"] = {
+        "preset": preset_name,
+        "params": dict(overlay_params),
+        "trigger_days": trigger_days,
+        "trigger_rate": trigger_rate,
+    }
+    return result
+
+
+def _calc_equity_stats_from_series(eq: pd.Series) -> dict[str, float]:
+    if eq is None or len(eq) < 2:
+        return {"total_return": np.nan, "annual_return": np.nan, "max_drawdown": np.nan}
+    s = pd.to_numeric(eq, errors="coerce").dropna()
+    if len(s) < 2:
+        return {"total_return": np.nan, "annual_return": np.nan, "max_drawdown": np.nan}
+    total_ret = float(s.iloc[-1] / s.iloc[0] - 1.0)
+    years = max((s.index[-1] - s.index[0]).days / 365.25, 1.0 / 252.0)
+    ann = float((1.0 + total_ret) ** (1.0 / years) - 1.0) if (1.0 + total_ret) > 0 else np.nan
+    mdd = float((s / s.cummax() - 1.0).min())
+    return {"total_return": total_ret, "annual_return": ann, "max_drawdown": mdd}
+
+
+def _compute_crash_overlay_preset_comparison(
+    ds_base: pd.DataFrame,
+    df_raw: pd.DataFrame,
+    ticker: str,
+    strat_params: Optional[dict] = None,
+    market_df: Optional[pd.DataFrame] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (normalized_equity_df, summary_df) for baseline + all crash presets."""
+    if ds_base is None or ds_base.empty or "w" not in ds_base.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if market_df is None or market_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ds = ds_base.copy()
+    ds.index = pd.to_datetime(ds.index, errors="coerce")
+    ds = ds[ds.index.notna()].sort_index()
+    if ds.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    px_col = "open" if "open" in df_raw.columns else ("close" if "close" in df_raw.columns else None)
+    if px_col is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    open_px = pd.to_numeric(df_raw[px_col], errors="coerce")
+    open_px.index = pd.to_datetime(df_raw.index, errors="coerce")
+    open_px = open_px[open_px.index.notna()].sort_index()
+    idx = open_px.index.intersection(ds.index)
+    if len(idx) < 20:
+        return pd.DataFrame(), pd.DataFrame()
+
+    open_px = open_px.reindex(idx).dropna()
+    if open_px.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    w_base = pd.to_numeric(ds["w"], errors="coerce").reindex(open_px.index).ffill().fillna(0.0).clip(0.0, 1.0)
+
+    try:
+        from SSS_EnsembleTab import CostParams, calculate_performance
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+    trade_cost = strat_params.get("trade_cost", {}) if isinstance(strat_params, dict) else {}
+    ticker_core = str(ticker or "").split(".")[0]
+    default_tax_bp = 10.0 if ticker_core.startswith("00") else 30.0
+    cost = CostParams(
+        buy_fee_bp=float(trade_cost.get("buy_fee_bp", 4.27)),
+        sell_fee_bp=float(trade_cost.get("sell_fee_bp", 4.27)),
+        sell_tax_bp=float(trade_cost.get("sell_tax_bp", default_tax_bp)),
+    )
+
+    eq_base, trades_base, _, _ = calculate_performance(open_px, w_base, cost)
+    if eq_base is None or len(eq_base) < 2:
+        return pd.DataFrame(), pd.DataFrame()
+
+    eq_map: dict[str, pd.Series] = {"原始": eq_base}
+    rows: list[dict[str, Any]] = []
+
+    base_stats = _calc_equity_stats_from_series(eq_base)
+    rows.append(
+        {
+            "方案": "原始",
+            "總回報率": base_stats["total_return"],
+            "年化回報率": base_stats["annual_return"],
+            "最大回撤": base_stats["max_drawdown"],
+            "交易次數": int(len(trades_base)) if isinstance(trades_base, pd.DataFrame) else 0,
+            "觸發天數": 0,
+            "觸發率": 0.0,
+        }
+    )
+
+    label_map = {
+        "sparse_vturn_cap010_v2": "Sparse VTurn v2 (cap=0.10)",
+        "sparse_vturn_cap015_v2": "Sparse VTurn v2 (cap=0.15)",
+        "sparse_vturn_cap020_v2": "Sparse VTurn v2 (cap=0.20)",
+        "best_00631l_v1": "Best 00631L v1",
+        "balanced_00631l_v1": "Balanced 00631L v1",
+        "mild_00631l_v1": "Mild 00631L v1",
+    }
+
+    for preset_key, preset in CRASH_OVERLAY_PRESETS.items():
+        try:
+            state, _ = _build_crash_overlay_state(open_px.index, market_df, preset)
+            if state.empty:
+                continue
+            w_overlay = (w_base * state.reindex(open_px.index).fillna(1.0)).clip(0.0, 1.0)
+            eq, trades_df, _, _ = calculate_performance(open_px, w_overlay, cost)
+            if eq is None or len(eq) < 2:
+                continue
+            label = label_map.get(preset_key, preset_key)
+            eq_map[label] = eq
+            st = _calc_equity_stats_from_series(eq)
+            trigger_days = int((state.reindex(open_px.index).fillna(1.0) < 0.999).sum())
+            trigger_rate = float(trigger_days / max(len(open_px), 1))
+            rows.append(
+                {
+                    "方案": label,
+                    "總回報率": st["total_return"],
+                    "年化回報率": st["annual_return"],
+                    "最大回撤": st["max_drawdown"],
+                    "交易次數": int(len(trades_df)) if isinstance(trades_df, pd.DataFrame) else 0,
+                    "觸發天數": trigger_days,
+                    "觸發率": trigger_rate,
+                }
+            )
+        except Exception:
+            continue
+
+    if len(eq_map) < 2:
+        return pd.DataFrame(), pd.DataFrame()
+
+    eq_norm = pd.DataFrame({k: (v / v.iloc[0]) for k, v in eq_map.items() if len(v) > 1})
+    summary = pd.DataFrame(rows)
+    return eq_norm, summary
+
+
+def _create_crash_xray_figure(
+    crash_debug_df: pd.DataFrame,
+    *,
+    strategy_name: str,
+    theme: str,
+) -> go.Figure:
+    if crash_debug_df is None or crash_debug_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"{strategy_name} Crash X-Ray（無資料）", height=340)
+        return fig
+
+    df = crash_debug_df.copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[df.index.notna()].sort_index()
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"{strategy_name} Crash X-Ray（無資料）", height=340)
+        return fig
+
+    if theme == "theme-light":
+        template = "plotly_white"
+    else:
+        template = "plotly_dark"
+
+    min_hits = float(pd.to_numeric(df.get("min_hits"), errors="coerce").dropna().iloc[-1]) if "min_hits" in df.columns and pd.to_numeric(df.get("min_hits"), errors="coerce").dropna().size else 3.0
+    day_drop_th = float(pd.to_numeric(df.get("day_drop_th"), errors="coerce").dropna().iloc[-1]) if "day_drop_th" in df.columns and pd.to_numeric(df.get("day_drop_th"), errors="coerce").dropna().size else np.nan
+    breadth_th = float(pd.to_numeric(df.get("breadth_th"), errors="coerce").dropna().iloc[-1]) if "breadth_th" in df.columns and pd.to_numeric(df.get("breadth_th"), errors="coerce").dropna().size else np.nan
+    limit_net_th = float(pd.to_numeric(df.get("limit_net_th"), errors="coerce").dropna().iloc[-1]) if "limit_net_th" in df.columns and pd.to_numeric(df.get("limit_net_th"), errors="coerce").dropna().size else np.nan
+    tv_ratio_th = float(pd.to_numeric(df.get("tv_ratio_th"), errors="coerce").dropna().iloc[-1]) if "tv_ratio_th" in df.columns and pd.to_numeric(df.get("tv_ratio_th"), errors="coerce").dropna().size else np.nan
+
+    fig = make_subplots(
+        rows=5,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        subplot_titles=(
+            "panic_hits（含 min_hits）",
+            "大跌（chg_pct）",
+            "跌家暴增（breadth）",
+            "跌停潮（limit_net）",
+            "爆量（tv_ratio）",
+        ),
+        row_heights=[0.22, 0.19, 0.19, 0.19, 0.21],
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=pd.to_numeric(df.get("panic_hits"), errors="coerce"),
+            name="panic_hits",
+            marker_color="#ff922b",
+            opacity=0.8,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=np.full(len(df), min_hits, dtype=float),
+            name="min_hits",
+            line=dict(color="#ff6b6b", width=1.5, dash="dash"),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=pd.to_numeric(df.get("chg_pct"), errors="coerce"),
+            name="chg_pct",
+            line=dict(color="#4dabf7", width=1.4),
+        ),
+        row=2,
+        col=1,
+    )
+    if np.isfinite(day_drop_th):
+        fig.add_hline(y=day_drop_th, line_color="#fa5252", line_width=1, line_dash="dash", row=2, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=pd.to_numeric(df.get("panic_day"), errors="coerce").fillna(0.0).astype(float),
+            name="panic_day",
+            marker_color="rgba(250,82,82,0.35)",
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=pd.to_numeric(df.get("breadth"), errors="coerce"),
+            name="breadth",
+            line=dict(color="#69db7c", width=1.4),
+        ),
+        row=3,
+        col=1,
+    )
+    if np.isfinite(breadth_th):
+        fig.add_hline(y=breadth_th, line_color="#fa5252", line_width=1, line_dash="dash", row=3, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=pd.to_numeric(df.get("panic_breadth"), errors="coerce").fillna(0.0).astype(float),
+            name="panic_breadth",
+            marker_color="rgba(250,82,82,0.35)",
+        ),
+        row=3,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=pd.to_numeric(df.get("limit_net"), errors="coerce"),
+            name="limit_net",
+            line=dict(color="#74c0fc", width=1.4),
+        ),
+        row=4,
+        col=1,
+    )
+    if np.isfinite(limit_net_th):
+        fig.add_hline(y=limit_net_th, line_color="#fa5252", line_width=1, line_dash="dash", row=4, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=pd.to_numeric(df.get("panic_limit"), errors="coerce").fillna(0.0).astype(float),
+            name="panic_limit",
+            marker_color="rgba(250,82,82,0.35)",
+        ),
+        row=4,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=pd.to_numeric(df.get("tv_ratio"), errors="coerce"),
+            name="tv_ratio",
+            line=dict(color="#ffd43b", width=1.4),
+        ),
+        row=5,
+        col=1,
+    )
+    if np.isfinite(tv_ratio_th):
+        fig.add_hline(y=tv_ratio_th, line_color="#fa5252", line_width=1, line_dash="dash", row=5, col=1)
+    fig.add_trace(
+        go.Bar(
+            x=df.index,
+            y=pd.to_numeric(df.get("panic_volume"), errors="coerce").fillna(0.0).astype(float),
+            name="panic_volume",
+            marker_color="rgba(250,82,82,0.35)",
+        ),
+        row=5,
+        col=1,
+    )
+
+    fig.update_layout(
+        template=template,
+        title=f"{strategy_name} Crash Overlay X-Ray",
+        height=1280,
+        hovermode="x unified",
+        margin=dict(l=55, r=20, t=55, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+    )
+    fig.update_yaxes(title_text="hits", row=1, col=1)
+    fig.update_yaxes(title_text="chg_pct", tickformat=".1%", row=2, col=1)
+    fig.update_yaxes(title_text="breadth", row=3, col=1)
+    fig.update_yaxes(title_text="limit_net", row=4, col=1)
+    fig.update_yaxes(title_text="tv_ratio", row=5, col=1)
+    fig.update_xaxes(showgrid=True, row=5, col=1)
+    return fig
+
 default_tickers = ["00631L.TW", "2330.TW", "00663L.TW", "00663L.TW", "00675L.TW", "00685L.TW"]
 
 
@@ -1416,6 +2172,105 @@ def _build_hide_strategy_options(all_names):
 hide_strategy_options = _build_hide_strategy_options(all_strategy_names)
 hide_strategy_defaults = [name for name in HIDE_PRESET_DEFAULTS if name in all_strategy_names]
 
+# Crash-only overlay presets.
+# 2026-03-10 sensitivity map suggests the robust core region is:
+#   min_hits=3, cooldown=5, with cap around 0.10~0.20.
+CRASH_OVERLAY_PRESETS = {
+    "sparse_vturn_cap010_v2": {
+        "ma": 20,
+        "dd_win": 250,
+        "dd_th": -0.0852797990720294,
+        "day_drop_th": -0.0240517748364169,
+        "breadth_th": -0.3227538840287519,
+        "limit_net_th": -0.3401478408310758,
+        "tv_win": 10,
+        "tv_ratio_th": 1.756825442586568,
+        "min_hits": 3,
+        "cap": 0.10,
+        "cooldown": 5,
+        "db_path": "twse_data.db",
+    },
+    "sparse_vturn_cap015_v2": {
+        "ma": 20,
+        "dd_win": 250,
+        "dd_th": -0.0852797990720294,
+        "day_drop_th": -0.0240517748364169,
+        "breadth_th": -0.3227538840287519,
+        "limit_net_th": -0.3401478408310758,
+        "tv_win": 10,
+        "tv_ratio_th": 1.756825442586568,
+        "min_hits": 3,
+        "cap": 0.15,
+        "cooldown": 5,
+        "db_path": "twse_data.db",
+    },
+    "sparse_vturn_cap020_v2": {
+        "ma": 20,
+        "dd_win": 250,
+        "dd_th": -0.0852797990720294,
+        "day_drop_th": -0.0240517748364169,
+        "breadth_th": -0.3227538840287519,
+        "limit_net_th": -0.3401478408310758,
+        "tv_win": 10,
+        "tv_ratio_th": 1.756825442586568,
+        "min_hits": 3,
+        "cap": 0.20,
+        "cooldown": 5,
+        "db_path": "twse_data.db",
+    },
+    "best_00631l_v1": {
+        "ma": 20,
+        "dd_win": 250,
+        "dd_th": -0.0852797990720294,
+        "day_drop_th": -0.0240517748364169,
+        "breadth_th": -0.3227538840287519,
+        "limit_net_th": -0.3401478408310758,
+        "tv_win": 10,
+        "tv_ratio_th": 1.756825442586568,
+        "min_hits": 3,
+        "cap": 0.05,
+        "cooldown": 5,
+        "db_path": "twse_data.db",
+    },
+    "balanced_00631l_v1": {
+        "ma": 60,
+        "dd_win": 250,
+        "dd_th": -0.1418599704645447,
+        "day_drop_th": -0.0342399324425173,
+        "breadth_th": -0.3914386391806469,
+        "limit_net_th": -0.0937363569245414,
+        "tv_win": 20,
+        "tv_ratio_th": 1.5549949091094372,
+        "min_hits": 3,
+        "cap": 0.15,
+        "cooldown": 21,
+        "db_path": "twse_data.db",
+    },
+    "mild_00631l_v1": {
+        "ma": 40,
+        "dd_win": 90,
+        "dd_th": -0.0763065377812218,
+        "day_drop_th": -0.0392352640774065,
+        "breadth_th": -0.4268922350909967,
+        "limit_net_th": -0.1630301044112239,
+        "tv_win": 40,
+        "tv_ratio_th": 1.4251039919392948,
+        "min_hits": 2,
+        "cap": 0.20,
+        "cooldown": 5,
+        "db_path": "twse_data.db",
+    },
+}
+DEFAULT_CRASH_OVERLAY_PRESET = "sparse_vturn_cap015_v2"
+CRASH_OVERLAY_PRESET_OPTIONS = [
+    {"label": "Sparse VTurn v2 (cap=0.15) [Recommended]", "value": "sparse_vturn_cap015_v2"},
+    {"label": "Sparse VTurn v2 (cap=0.10)", "value": "sparse_vturn_cap010_v2"},
+    {"label": "Sparse VTurn v2 (cap=0.20)", "value": "sparse_vturn_cap020_v2"},
+    {"label": "Best 00631L v1", "value": "best_00631l_v1"},
+    {"label": "Balanced 00631L v1", "value": "balanced_00631l_v1"},
+    {"label": "Mild 00631L v1", "value": "mild_00631l_v1"},
+]
+
 # 初始化倉庫下拉選單選項
 warehouse_options = []
 if manager:
@@ -1461,11 +2316,12 @@ def get_column_display_name(column_name):
         "delta_units": "股數變化",
         "exec_notional": "成交金額",
         "equity_after": "交易後權益",
-        "cash_after": "交易後現金",
         "equity_pct": "權益%",
-        "cash_pct": "現金%",
         "invested_pct": "在場比例",
         "position_value": "部位市值",
+        "crash_triggered": "Crash觸發",
+        "crash_reason": "Crash原因",
+        "base_reason": "原始原因",
         "comment": "備註",
     }
     return column_mapping.get(column_name, column_name)
@@ -1492,11 +2348,12 @@ DISPLAY_NAME = {
     "delta_units": "股數變化",
     "exec_notional": "成交金額",
     "equity_after": "交易後權益",
-    "cash_after": "交易後現金",
     "equity_pct": "權益%",
-    "cash_pct": "現金%",
     "invested_pct": "在場比例",
     "position_value": "部位市值",
+    "crash_triggered": "Crash觸發",
+    "crash_reason": "Crash原因",
+    "base_reason": "原始原因",
     "comment": "備註",
 }
 
@@ -1511,6 +2368,8 @@ HIDE_COLS = {
     "date",
     "open",
     "equity_open_after_trade",
+    "cash_after",
+    "cash_pct",
 }
 
 
@@ -1525,6 +2384,9 @@ PREFER_ORDER = [
     "return",
     "shares",
     "reason",
+    "base_reason",
+    "crash_triggered",
+    "crash_reason",
     "fee",
     "net_amount",
     "leverage_ratio",
@@ -1535,9 +2397,7 @@ PREFER_ORDER = [
     "delta_units",
     "exec_notional",
     "equity_after",
-    "cash_after",
     "equity_pct",
-    "cash_pct",
     "invested_pct",
     "position_value",
     "comment",
@@ -1591,13 +2451,37 @@ def format_trade_like_df_for_display(df):
                 else f"{(r['equity_after'] / tot.loc[r.name]):.2%}",
                 axis=1,
             )
-        if "cash_pct" not in d.columns:
-            d["cash_pct"] = d.apply(
-                lambda r: ""
-                if pd.isna(r["cash_after"]) or pd.isna(tot.loc[r.name]) or tot.loc[r.name] <= 0
-                else f"{(r['cash_after'] / tot.loc[r.name]):.2%}",
-                axis=1,
-            )
+
+    def _fmt_percent_cell(x):
+        if pd.isna(x):
+            return ""
+        s = str(x).strip()
+        if s == "":
+            return ""
+        if s.endswith("%"):
+            v = pd.to_numeric(s[:-1], errors="coerce")
+            return f"{v:.2f}%" if pd.notna(v) else s
+        v = pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
+        if pd.isna(v):
+            return s
+        # 比例欄位通常是 0~1；若來源已是 0~100 則保留為百分點。
+        return f"{v:.2%}" if abs(v) <= 1.0 else f"{v:.2f}%"
+
+    def _fmt_numeric_cell(x, decimals=2, as_int=False, fixed_decimals=False):
+        if pd.isna(x):
+            return ""
+        s = str(x).strip()
+        if s == "":
+            return ""
+        v = pd.to_numeric(pd.Series([s.replace(",", "")]), errors="coerce").iloc[0]
+        if pd.isna(v):
+            return s
+        if as_int:
+            return f"{int(round(v)):,}"
+        txt = f"{float(v):,.{decimals}f}"
+        if fixed_decimals:
+            return txt
+        return txt.rstrip("0").rstrip(".")
 
     def _fmt_date_col(s):
         dt = pd.to_datetime(s, errors="coerce")
@@ -1633,31 +2517,44 @@ def format_trade_like_df_for_display(df):
             "end_of_period": "期末平倉",
             "ensemble_rebalance_buy": "再平衡買入",
             "ensemble_rebalance_sell": "再平衡賣出",
+            "crash_overlay_buy": "Crash Overlay 買入",
+            "crash_overlay_sell": "Crash Overlay 賣出",
+            "crash_overlay_adjust": "Crash Overlay 調整",
         }
         reason_series = d["reason"].fillna("").astype(str).str.strip().str.lower()
         d["reason"] = reason_series.map(reason_map).fillna(reason_series)
+        for extra_reason_col in ["crash_reason", "base_reason"]:
+            if extra_reason_col in d.columns:
+                extra_series = d[extra_reason_col].fillna("").astype(str).str.strip().str.lower()
+                d[extra_reason_col] = extra_series.map(reason_map).fillna(extra_series)
+
+    if "crash_triggered" in d.columns:
+        d["crash_triggered"] = d["crash_triggered"].apply(
+            lambda x: "是" if str(x).strip().lower() in {"1", "true", "t", "yes", "y", "是"} else ("否" if str(x).strip() != "" else "")
+        )
 
     if "price" in d.columns:
-        d["price"] = d["price"].apply(lambda x: f"{x:,.2f}" if pd.notnull(x) else "")
-    if "weight_change" in d.columns:
-        d["weight_change"] = d["weight_change"].apply(lambda x: f"{x:.3f}" if pd.notnull(x) else "")
-    for col in ["w_before", "w_after"]:
+        d["price"] = d["price"].apply(lambda x: _fmt_numeric_cell(x, decimals=1, as_int=False, fixed_decimals=True))
+    for col in ["weight_change", "w_before", "w_after"]:
         if col in d.columns:
-            d[col] = d[col].apply(lambda x: f"{x:.3f}" if pd.notnull(x) else "")
+            d[col] = d[col].apply(_fmt_percent_cell)
     if "return" in d.columns:
         d["return"] = d["return"].apply(lambda x: "-" if pd.isna(x) else f"{x:.2%}")
+    for col in ["equity_pct", "invested_pct"]:
+        if col in d.columns:
+            d[col] = d[col].apply(_fmt_percent_cell)
     if "shares" in d.columns:
         d["shares"] = d["shares"].apply(lambda x: f"{int(round(x)):,}" if pd.notnull(x) else "")
     for col in ["fee", "net_amount"]:
         if col in d.columns:
-            d[col] = d[col].apply(lambda x: f"{x:,.2f}" if pd.notnull(x) else "")
+            d[col] = d[col].apply(lambda x: _fmt_numeric_cell(x, as_int=True))
     if "leverage_ratio" in d.columns:
-        d["leverage_ratio"] = d["leverage_ratio"].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "")
+        d["leverage_ratio"] = d["leverage_ratio"].apply(lambda x: _fmt_numeric_cell(x, decimals=1, as_int=False, fixed_decimals=True))
     for col in ["indicator_smaa", "indicator_base", "indicator_sd"]:
         if col in d.columns:
-            d[col] = d[col].apply(lambda x: f"{x:.3f}" if pd.notnull(x) else "")
+            d[col] = d[col].apply(lambda x: _fmt_numeric_cell(x, decimals=1, as_int=False, fixed_decimals=True))
 
-    for col in ["exec_notional", "equity_after", "cash_after", "position_value"]:
+    for col in ["exec_notional", "equity_after", "position_value"]:
         if col in d.columns:
             d[col] = d[col].apply(lambda x: f"{int(round(x)):,}" if pd.notnull(x) else "")
     if "delta_units" in d.columns:
@@ -1783,10 +2680,18 @@ app.layout = html.Div([
                         html.Label("測試選項", className="small mb-1"),
                         dbc.Checkbox(id='force-valve-trigger', value=False, label="強制觸發閥門", className="small text-danger"),
                         dbc.Checkbox(id='smart-leverage-switch', value=False, label="Smart Leverage (0050代替現金)", className="small text-success fw-bold"),
-                    ], width=2),
+                        dbc.Checkbox(id='crash-overlay-switch', value=False, label="Crash-only Overlay", className="small text-warning fw-bold mt-1"),
+                        dcc.Dropdown(
+                            id='crash-overlay-preset',
+                            options=CRASH_OVERLAY_PRESET_OPTIONS,
+                            value=DEFAULT_CRASH_OVERLAY_PRESET,
+                            clearable=False,
+                            style={"marginTop": "4px", "fontSize": "12px"},
+                        ),
+                    ], width=3),
                     dbc.Col([
                         html.Div(id='risk-valve-status', className="small p-2", style={"borderRadius":"4px"}),
-                    ], width=6),
+                    ], width=5),
                 ], className='p-2 mb-2', style={'borderRadius': '4px'}),
 
                 # Row 3: 策略倉庫 & 兩組 Ensemble 參數 + 執行按鈕
@@ -2023,7 +2928,7 @@ def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, t
                                     html.Br(),
                                     html.Small(f"風險CAP: {risk_cap*100:.0f}%", style={"color":"#666","fontSize":"11px"}),
                                     html.Br(),
-                                    html.Small(f"現金保留下限: {(1-risk_cap)*100:.0f}%", style={"color":"#666","fontSize":"11px"}),
+                                    html.Small(f"保留下限: {(1-risk_cap)*100:.0f}%", style={"color":"#666","fontSize":"11px"}),
                                     html.Br(),
                                     html.Small("--- 除錯資訊 ---", style={"color":"#999","fontSize":"10px","fontStyle":"italic"}),
                                     html.Small([html.Div(info) for info in debug_info], style={"color":"#999","fontSize":"9px"})
@@ -2099,6 +3004,8 @@ def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, t
         Input('risk-cap-input', 'value'),
         Input('atr-ratio-threshold', 'value'),
         Input('force-valve-trigger', 'value'),
+        Input('crash-overlay-switch', 'value'),
+        Input('crash-overlay-preset', 'value'),
         Input('warehouse-dropdown', 'value'),
         # Ensemble_Majority 參數
         Input('majority-floor', 'value'),
@@ -2116,7 +3023,7 @@ def update_risk_valve_status(global_apply, risk_cap, atr_ratio, force_trigger, t
     State('backtest-store', 'data')
 )
 def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date, end_date, discount, cooldown, bad_holding,
-                global_apply, risk_cap, atr_ratio, force_trigger, warehouse_file,
+                global_apply, risk_cap, atr_ratio, force_trigger, crash_overlay_on, crash_overlay_preset, warehouse_file,
                 maj_floor, maj_ema, maj_delta, maj_cooldown, maj_dw,
                 prop_floor, prop_ema, prop_delta, prop_cooldown, prop_dw,
                 stored_data):
@@ -2152,6 +3059,25 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
         f"開始執行回測 - ticker: {ticker}, 策略數: {len(active_strategy_names)}, 隱藏數: {len(hidden_set)}"
     )
     results = {}
+    crash_overlay_key = (
+        crash_overlay_preset
+        if crash_overlay_preset in CRASH_OVERLAY_PRESETS
+        else DEFAULT_CRASH_OVERLAY_PRESET
+    )
+    crash_overlay_params = CRASH_OVERLAY_PRESETS.get(crash_overlay_key, {})
+    crash_market_df = None
+    if crash_overlay_on:
+        crash_db_path = str(crash_overlay_params.get("db_path", "twse_data.db"))
+        if not os.path.exists(crash_db_path):
+            logger.warning("[CrashOverlay] 資料庫不存在: %s，將跳過 crash-only 套用", crash_db_path)
+            crash_overlay_on = False
+        else:
+            try:
+                crash_market_df = _build_twse_market_features(db_path=crash_db_path)
+                logger.info("[CrashOverlay] 已載入市場特徵: preset=%s, rows=%d", crash_overlay_key, len(crash_market_df))
+            except Exception as exc:
+                logger.warning("[CrashOverlay] 載入市場特徵失敗: %s", exc)
+                crash_overlay_on = False
 
     # === 新增：全局風險閥門觸發狀態追蹤 ===
     valve_triggered = False
@@ -3079,6 +4005,29 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
                     else:
                         logger.warning(f"[{strat}] 風險閥門重算沒有返回結果")
 
+        # === Crash-only Overlay（可選）：在 baseline/valve 後再覆蓋一次 ===
+        if crash_overlay_on:
+            try:
+                result = _apply_crash_overlay_to_result(
+                    result=result,
+                    df_raw=df_raw,
+                    strat_params=strat_params if isinstance(strat_params, dict) else {},
+                    ticker=ticker,
+                    preset_name=crash_overlay_key,
+                    overlay_params=crash_overlay_params,
+                    market_df=crash_market_df,
+                )
+                valve_meta = result.get("valve", {}) if isinstance(result, dict) else {}
+                if valve_meta.get("mode") == "crash_only" and valve_meta.get("applied"):
+                    logger.info(
+                        "[%s] Crash-only overlay 已套用: preset=%s, trigger_days=%s, trigger_rate=%.2f%%",
+                        strat,
+                        crash_overlay_key,
+                        valve_meta.get("trigger_days", "N/A"),
+                        float(valve_meta.get("trigger_rate", 0.0)) * 100.0,
+                    )
+            except Exception as exc:
+                logger.warning("[%s] Crash-only overlay 套用失敗: %s", strat, exc)
 
         results[strat] = result
 
@@ -3333,6 +4282,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
     if tab == "backtest":
         # 創建策略回測的子頁籤
         strategy_tabs = []
+
         for strategy in strategy_names:
             result = results.get(strategy)
             if not result:
@@ -3747,17 +4697,19 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             # 🔧 修正 log 檢查（原本錯用 daily_state.columns）
             logger.info(f"[UI] daily_state_display cols={list(daily_state_display.columns) if daily_state_display is not None else None}")
             if daily_state_display is not None:
-                has_cols = {'equity','cash'}.issubset(daily_state_display.columns)
-                logger.info(f"[UI] daily_state_display head=\n{daily_state_display[['equity','cash']].head(3) if has_cols else 'Missing equity/cash columns'}")
+                has_cols = {"equity"}.issubset(daily_state_display.columns)
+                logger.info(f"[UI] daily_state_display head=\n{daily_state_display[['equity']].head(3) if has_cols else 'Missing equity columns'}")
 
             vote_series = None
             vote_threshold = None
             vote_diagnostics = _new_vote_diagnostics()
             vote_warning_component = html.Div()
             indicator_daily = df_from_pack(result.get("indicator_daily"))
+            crash_state_series = series_from_pack(result.get("crash_state"))
+            crash_debug_df = df_from_pack(result.get("crash_debug_df"))
 
             # === 🎯 建立統一圖表（三圖同步） ===
-            if daily_state_display is not None and not daily_state_display.empty and {'equity','cash'}.issubset(daily_state_display.columns):
+            if daily_state_display is not None and not daily_state_display.empty and {"equity"}.issubset(daily_state_display.columns):
                 vote_series, vote_threshold, vote_diagnostics = compute_ensemble_vote_series(
                     daily_state_display,
                     strategy,
@@ -3776,12 +4728,15 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                 unified_fig = create_unified_dashboard(
                     df_raw=df_raw,
                     daily_state=daily_state_display,
-                    trade_df=trade_df,
+                    trade_df=base_df,
                     ticker=ticker,
                     theme='dark' if theme == 'theme-dark' else 'light',
                     votes_series=vote_series,
                     votes_threshold=vote_threshold,
                     indicator_df=indicator_daily,
+                    show_raw_signal_highlight=not DISABLE_SMAA_RAW_HIGHLIGHT,
+                    crash_state=crash_state_series if ENABLE_CASH_ONLY_XRAY_SUBPLOTS else None,
+                    crash_trade_df=base_df,
                 )
 
                 # 原始的分離圖表（已註解）
@@ -3803,7 +4758,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                 # 準備資金權重表格數據
                 if not daily_state_display.empty:
                     # 選擇要顯示的欄位（與 Streamlit 一致）
-                    display_cols = ['portfolio_value', 'position_value', 'cash', 'invested_pct', 'cash_pct', 'w']
+                    display_cols = ["portfolio_value", "position_value", "invested_pct", "w"]
                     available_cols = [col for col in display_cols if col in daily_state_display.columns]
 
                     if available_cols:
@@ -3812,13 +4767,13 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                         display_daily_state.index = display_daily_state.index.strftime('%Y-%m-%d')
 
                         # 格式化數值
-                        for col in ['portfolio_value','position_value','cash']:
+                        for col in ["portfolio_value", "position_value"]:
                             if col in display_daily_state.columns:
                                 display_daily_state[col] = display_daily_state[col].apply(
                                     lambda x: f"{int(round(x)):,}" if pd.notnull(x) and not pd.isna(x) else ""
                                 )
 
-                        for col in ['invested_pct','cash_pct']:
+                        for col in ["invested_pct"]:
                             if col in display_daily_state.columns:
                                 display_daily_state[col] = display_daily_state[col].apply(
                                     lambda x: f"{x:.2%}" if pd.notnull(x) else ""
@@ -3827,13 +4782,13 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                         for col in ['w']:
                             if col in display_daily_state.columns:
                                 display_daily_state[col] = display_daily_state[col].apply(
-                                    lambda x: f"{x:.4f}" if pd.notnull(x) else ""
+                                    lambda x: f"{x:.2%}" if pd.notnull(x) else ""
                                 )
 
                         # 創建資金權重表格
                         daily_state_table = html.Div([
                             html.H5("總資產配置", style={"marginTop": "16px", "color": font_color}),
-                            html.Div("每日資產配置狀態，包含總資產、倉位市值、現金、投資比例等",
+                            html.Div("每日資產配置狀態，包含總資產、倉位市值、投資比例等",
                                      style={"fontSize": "14px", "color": font_color, "marginBottom": "8px"}),
                             dash_table.DataTable(
                                 columns=[{"name": i, "id": i} for i in display_daily_state.columns],
@@ -3875,7 +4830,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                 # else:
                 #     fig_w = go.Figure()
 
-                daily_state_table = html.Div("使用交易表重建的權益/現金曲線", style={"color": "#888", "fontStyle": "italic"})
+                daily_state_table = html.Div("使用交易表重建的權益曲線", style={"color": "#888", "fontStyle": "italic"})
 
             # 原始的 fig2 layout 更新（已不需要）
             # fig2.update_layout(
@@ -3883,6 +4838,35 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             #     legend_font_color=legend_font_color,
             #     legend=dict(bgcolor=legend_bgcolor, bordercolor=legend_bordercolor, font=dict(color=legend_font_color))
             # )
+
+            crash_xray_section = html.Div()
+            if ENABLE_CASH_ONLY_XRAY_SUBPLOTS:
+                if isinstance(crash_debug_df, pd.DataFrame) and not crash_debug_df.empty:
+                    crash_xray_fig = _create_crash_xray_figure(
+                        crash_debug_df=crash_debug_df,
+                        strategy_name=strategy,
+                        theme=theme,
+                    )
+                    crash_xray_section = html.Div(
+                        [
+                            html.H5("Crash Overlay X-Ray", style={"marginTop": "12px", "color": font_color}),
+                            html.Div(
+                                "顯示 panic_hits 與 4 類觸發條件（大跌/跌家暴增/跌停潮/爆量）",
+                                style={"fontSize": "12px", "color": "#888", "marginBottom": "6px"},
+                            ),
+                            dcc.Graph(
+                                figure=crash_xray_fig,
+                                config={"displayModeBar": True, "scrollZoom": True},
+                                className="crash-xray-graph",
+                            ),
+                        ],
+                        style={"marginTop": "6px"},
+                    )
+                else:
+                    crash_xray_section = html.Div(
+                        "Crash Overlay X-Ray 無資料（尚未套用 crash-only 或判定資料缺失）。",
+                        style={"fontSize": "12px", "color": "#888", "marginTop": "10px"},
+                    )
 
             # === 計算風險閥門徽章內容 ===
             valve = results.get(strategy, {}).get('valve', {}) or {}
@@ -3894,6 +4878,13 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                 valve_badge_extra.append(f"ATR比值={valve['atr_ratio']:.2f}")
             elif valve.get("atr_ratio") == "forced":
                 valve_badge_extra.append("強制觸發")
+            if str(valve.get("mode")) == "crash_only":
+                if valve.get("preset"):
+                    valve_badge_extra.append(f"Crash={valve.get('preset')}")
+                if isinstance(valve.get("trigger_rate"), (int, float)):
+                    valve_badge_extra.append(f"觸發率={float(valve['trigger_rate']):.1%}")
+                if isinstance(valve.get("trigger_days"), (int, float)):
+                    valve_badge_extra.append(f"天數={int(valve['trigger_days'])}")
 
             valve_badge = html.Span(
                 "🛡️ 風險閥門：" + valve_badge_text + ((" | " + " | ".join(valve_badge_extra)) if valve_badge_extra else ""),
@@ -3931,6 +4922,36 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             last_sig_color = sig_color_map.get(last_sig_code, "#868e96")
             last_sig_reason = str(latest_t_signal.get("last_signal_reason") or "")
 
+            def _friendly_signal_reason(raw_reason: str, signal_code: str, *, is_last: bool = False) -> str:
+                reason = str(raw_reason or "").strip()
+                reason_map = {
+                    "smaa小於買入閥值": "閥值偏向低檔",
+                    "smaa大於賣出閥值": "閥值偏向高檔",
+                    "在買賣閥值之間": "閥值在區間",
+                    "交易冷卻中": "冷卻期內先不動作",
+                    "已有持倉不再買": "已持有部位",
+                    "無持倉可賣": "無持倉可賣出",
+                    "無轉折訊號": "無明確轉折",
+                    "轉折向上訊號": "出現轉強訊號",
+                    "轉折向下訊號": "出現轉弱訊號",
+                    "已執行的最後訊號": "最近一次實際訊號",
+                    "單一資料點無法判斷訊號變化": "資料不足",
+                }
+                if reason in reason_map:
+                    return reason_map[reason]
+                if reason:
+                    return reason
+                if is_last:
+                    return "沒有可回溯上次訊號說明"
+                if signal_code == "BUY":
+                    return "訊號為買入"
+                if signal_code == "SELL":
+                    return "訊號為賣出"
+                return "無明確買賣條件，先觀望"
+
+            sig_reason_text = _friendly_signal_reason(sig_reason, sig_code, is_last=False)
+            last_sig_reason_text = _friendly_signal_reason(last_sig_reason, last_sig_code, is_last=True)
+
             actionable_signal_card = dbc.Col(
                 [
                     dbc.Card(
@@ -3957,7 +4978,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                                         ),
                                     ]),
 
-                                    html.Div(sig_reason if sig_reason else "條件：N/A", style={"fontSize": "11px", "color": "#888"}),
+                                    html.Div(sig_reason_text, style={"fontSize": "11px", "color": "#888"}),
                                 ]
                             )
                         ],
@@ -3988,7 +5009,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                                     ),
                                         html.Span(f"({last_sig_date})", style={"fontSize": "12px", "color": card_text})
                                     ]),
-                                    html.Div(last_sig_reason if last_sig_reason else "條件：N/A", style={"fontSize": "11px", "color": "#888"}),
+                                    html.Div(last_sig_reason_text, style={"fontSize": "11px", "color": "#888"}),
                                 ]
                             )
                         ],
@@ -4006,6 +5027,15 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             )
 
             summary_cards = [actionable_signal_card, latest_emitted_signal_card] + metric_cards
+            trade_table_style_conditional = []
+            if isinstance(display_df, pd.DataFrame) and "Crash觸發" in display_df.columns:
+                trade_table_style_conditional = [
+                    {
+                        "if": {"filter_query": "{Crash觸發} = 是"},
+                        "backgroundColor": "rgba(255, 107, 107, 0.20)",
+                        "fontWeight": "bold",
+                    }
+                ]
 
             strategy_content = html.Div([
                 html.H4([
@@ -4033,6 +5063,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                     className='unified-dashboard-graph',
                     style=unified_graph_style
                 ),
+                crash_xray_section,
 
                 # 原始的三張分離圖表（已註解）
                 # dcc.Graph(figure=fig1, config={'displayModeBar': True}, className='main-metrics-graph'),
@@ -4051,6 +5082,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                     style_table={'overflowX': 'auto', 'backgroundColor': bg_color},
                     style_cell={'textAlign': 'center', 'backgroundColor': table_cell_bg, 'color': table_text, 'border': f'1px solid {table_border}'},
                     style_header={'backgroundColor': table_header_bg, 'color': table_text, 'border': f'1px solid {table_border}'},
+                    style_data_conditional=trade_table_style_conditional,
                     id={'type': 'strategy-table', 'strategy': strategy}
                 ),
 

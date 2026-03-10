@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,49 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_true_spans(index: Iterable[pd.Timestamp], mask: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Convert a boolean mask into contiguous [start, end] spans on the given index."""
+    idx = pd.DatetimeIndex(pd.to_datetime(index, errors="coerce"))
+    idx = idx[idx.notna()]
+    if idx.empty:
+        return []
+    m = pd.Series(mask, index=idx)
+    m = m.reindex(idx).fillna(False).astype(bool)
+    if not bool(m.any()):
+        return []
+
+    spans: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    start: Optional[pd.Timestamp] = None
+    prev: Optional[pd.Timestamp] = None
+    for dt, flag in m.items():
+        if flag:
+            if start is None:
+                start = dt
+            prev = dt
+        elif start is not None and prev is not None:
+            spans.append((pd.Timestamp(start), pd.Timestamp(prev)))
+            start = None
+            prev = None
+    if start is not None and prev is not None:
+        spans.append((pd.Timestamp(start), pd.Timestamp(prev)))
+    return spans
+
+
+def _truthy_series(raw: pd.Series) -> pd.Series:
+    """Normalize mixed bool/string/number values to boolean Series."""
+    if raw is None:
+        return pd.Series(dtype=bool)
+    s = pd.Series(raw).copy()
+    if s.empty:
+        return s.astype(bool)
+    if s.dtype == bool:
+        return s.fillna(False)
+    if pd.api.types.is_numeric_dtype(s):
+        return s.fillna(0).astype(float) != 0.0
+    txt = s.fillna("").astype(str).str.strip().str.lower()
+    return txt.isin({"1", "true", "t", "yes", "y", "是"})
 
 
 def calculate_lifo_returns(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -98,13 +141,16 @@ def create_unified_dashboard(
     votes_series: Optional[pd.Series] = None,
     votes_threshold: Optional[float] = None,
     indicator_df: Optional[pd.DataFrame] = None,
+    show_raw_signal_highlight: bool = True,
+    crash_state: Optional[pd.Series] = None,
+    crash_trade_df: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     """建立統一儀表板（X 軸同步）。"""
 
     labels = {
         "title_price": "股價與買賣點",
         "title_indicator": "每日 SMAA 與閥值",
-        "title_eq": "權益與現金",
+        "title_eq": "權益",
         "title_weight": "持倉權重(%)",
         "title_lifo": "LIFO 交易報酬",
         "title_votes": "Ensemble 投票",
@@ -173,6 +219,11 @@ def create_unified_dashboard(
 
     close_col = _pick_col(df_raw_aligned, ["close", "Close", "收盤價"])
     has_votes = votes_series is not None and len(votes_series) > 0
+    crash_state_series = pd.Series(dtype=float)
+    if isinstance(crash_state, pd.Series) and not crash_state.empty:
+        crash_state_series = pd.to_numeric(crash_state, errors="coerce")
+        crash_state_series.index = pd.to_datetime(crash_state_series.index, errors="coerce")
+        crash_state_series = crash_state_series[crash_state_series.index.notna()].sort_index()
 
     row_price = 1
     row_indicator = 2 if has_indicator else None
@@ -239,6 +290,28 @@ def create_unified_dashboard(
             trace.legend = _row_legend_id(row)
         fig.add_trace(trace, row=row, col=1, secondary_y=secondary_y)
 
+    def _add_vrect_spans(
+        spans: list[tuple[pd.Timestamp, pd.Timestamp]],
+        *,
+        row: int,
+        color: str,
+        opacity: float,
+        layer: str = "below",
+    ) -> None:
+        for start, end in spans:
+            x0 = pd.Timestamp(start)
+            x1 = pd.Timestamp(end) + pd.Timedelta(days=1)
+            fig.add_vrect(
+                x0=x0,
+                x1=x1,
+                fillcolor=color,
+                opacity=opacity,
+                line_width=0,
+                layer=layer,
+                row=row,
+                col=1,
+            )
+
     # Row 1: 股價與買賣點
     if not df_raw_aligned.empty and close_col:
         _add_trace(
@@ -250,24 +323,43 @@ def create_unified_dashboard(
             ),
             row=1,
         )
+        if not crash_state_series.empty:
+            aligned_state = crash_state_series.reindex(df_raw_aligned.index).ffill().fillna(1.0)
+            crash_spans = _iter_true_spans(df_raw_aligned.index, aligned_state < 0.999)
+            _add_vrect_spans(crash_spans, row=1, color="#ff6b6b", opacity=0.10)
 
-    if trade_df is not None and not trade_df.empty:
-        tdf = trade_df.copy()
+    trade_source = crash_trade_df if (isinstance(crash_trade_df, pd.DataFrame) and not crash_trade_df.empty) else trade_df
+    if trade_source is not None and not trade_source.empty:
+        tdf = trade_source.copy()
         tdf.columns = [str(c).lower() for c in tdf.columns]
         if "trade_date" in tdf.columns:
             tdf["trade_date"] = pd.to_datetime(tdf["trade_date"], errors="coerce")
+        if "price" in tdf.columns:
+            tdf["price"] = pd.to_numeric(tdf["price"], errors="coerce")
+        crash_trigger = _truthy_series(tdf.get("crash_triggered", pd.Series(False, index=tdf.index)))
+        reason_series = tdf.get("crash_reason", tdf.get("reason", pd.Series("", index=tdf.index)))
+        reason_series = reason_series.fillna("").astype(str).str.lower()
+        reason_crash_mask = reason_series.str.contains("crash_overlay", na=False)
+        crash_mask = (crash_trigger | reason_crash_mask).reindex(tdf.index).fillna(False)
         type_col = "type" if "type" in tdf.columns else ("action" if "action" in tdf.columns else None)
         if type_col and {"trade_date", "price"}.issubset(tdf.columns):
-            buys = tdf[tdf[type_col].astype(str).str.contains("buy|add", case=False, na=False)]
-            sells = tdf[tdf[type_col].astype(str).str.contains("sell", case=False, na=False)]
+            buys = tdf[tdf[type_col].astype(str).str.contains("buy|add|long", case=False, na=False)]
+            sells = tdf[tdf[type_col].astype(str).str.contains("sell|exit", case=False, na=False)]
             forced = sells[sells[type_col].astype(str).str.contains("forced", case=False, na=False)]
             normal_sells = sells[~sells[type_col].astype(str).str.contains("forced", case=False, na=False)]
 
-            if not buys.empty:
+            crash_buy_idx = buys.index.intersection(crash_mask[crash_mask].index)
+            crash_sell_idx = normal_sells.index.intersection(crash_mask[crash_mask].index)
+            crash_buys = buys.loc[crash_buy_idx]
+            crash_sells = normal_sells.loc[crash_sell_idx]
+            normal_buys = buys.drop(index=crash_buy_idx, errors="ignore")
+            normal_sells = normal_sells.drop(index=crash_sell_idx, errors="ignore")
+
+            if not normal_buys.empty:
                 _add_trace(
                     go.Scatter(
-                        x=buys["trade_date"],
-                        y=pd.to_numeric(buys["price"], errors="coerce"),
+                        x=normal_buys["trade_date"],
+                        y=pd.to_numeric(normal_buys["price"], errors="coerce"),
                         mode="markers",
                         name=labels["buy"],
                         marker=dict(symbol="triangle-up", size=9, color="#00CC96"),
@@ -282,6 +374,28 @@ def create_unified_dashboard(
                         mode="markers",
                         name=labels["sell"],
                         marker=dict(symbol="triangle-down", size=9, color="#EF553B"),
+                    ),
+                    row=1,
+                )
+            if not crash_buys.empty:
+                _add_trace(
+                    go.Scatter(
+                        x=crash_buys["trade_date"],
+                        y=pd.to_numeric(crash_buys["price"], errors="coerce"),
+                        mode="markers",
+                        name="Crash Overlay 買入",
+                        marker=dict(symbol="diamond", size=10, color="#ffd43b", line=dict(color="#8a5d00", width=1)),
+                    ),
+                    row=1,
+                )
+            if not crash_sells.empty:
+                _add_trace(
+                    go.Scatter(
+                        x=crash_sells["trade_date"],
+                        y=pd.to_numeric(crash_sells["price"], errors="coerce"),
+                        mode="markers",
+                        name="Crash Overlay 賣出",
+                        marker=dict(symbol="x", size=11, color="#ff8787", line=dict(color="#8b0000", width=1)),
                     ),
                     row=1,
                 )
@@ -308,6 +422,23 @@ def create_unified_dashboard(
             ),
             row=row_indicator,
         )
+        if show_raw_signal_highlight:
+            buy_mask = pd.Series(False, index=indicator.index, dtype=bool)
+            sell_mask = pd.Series(False, index=indicator.index, dtype=bool)
+            if {"buy_threshold", "sell_threshold"}.issubset(indicator.columns):
+                buy_mask = (
+                    smaa_series
+                    < pd.to_numeric(indicator["buy_threshold"], errors="coerce")
+                ).fillna(False)
+                sell_mask = (
+                    smaa_series
+                    > pd.to_numeric(indicator["sell_threshold"], errors="coerce")
+                ).fillna(False)
+            elif {"is_buy_signal", "is_sell_signal"}.issubset(indicator.columns):
+                buy_mask = _truthy_series(indicator["is_buy_signal"]).reindex(indicator.index).fillna(False)
+                sell_mask = _truthy_series(indicator["is_sell_signal"]).reindex(indicator.index).fillna(False)
+            _add_vrect_spans(_iter_true_spans(indicator.index, buy_mask), row=row_indicator, color="#40c057", opacity=0.10)
+            _add_vrect_spans(_iter_true_spans(indicator.index, sell_mask), row=row_indicator, color="#fa5252", opacity=0.10)
         if "base" in indicator.columns:
             _add_trace(
                 go.Scatter(
@@ -361,16 +492,6 @@ def create_unified_dashboard(
                 ),
                 row=row_eq,
             )
-        if "cash" in ds.columns:
-            _add_trace(
-                go.Scatter(
-                    x=ds.index,
-                    y=pd.to_numeric(ds["cash"], errors="coerce"),
-                    name=labels["cash"],
-                    line=dict(color="#FFA15A", width=1.5, dash="dot"),
-                ),
-                row=row_eq,
-            )
 
     # Row 持倉權重
     if not ds.empty and "w" in ds.columns:
@@ -387,8 +508,8 @@ def create_unified_dashboard(
 
     # Row LIFO 報酬
     lifo_y_range = None
-    if trade_df is not None and not trade_df.empty:
-        lifo_df = calculate_lifo_returns(trade_df)
+    if trade_source is not None and not trade_source.empty:
+        lifo_df = calculate_lifo_returns(trade_source)
         valid_lifo = lifo_df[lifo_df["lifo_return"].notna()] if "lifo_return" in lifo_df.columns else pd.DataFrame()
         if not valid_lifo.empty:
             colors = ["#00CC96" if x > 0 else "#EF553B" for x in valid_lifo["lifo_return"]]
