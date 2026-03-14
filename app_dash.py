@@ -37,6 +37,9 @@ os.environ["SSS_CREATE_LOGS"] = "1"
 logger = get_logger("SSS.App")
 ENABLE_CASH_ONLY_XRAY_SUBPLOTS = os.environ.get("SSS_DASH_CASH_ONLY_XRAY", "0") == "1"
 DISABLE_SMAA_RAW_HIGHLIGHT = os.environ.get("SSS_DASH_DISABLE_SMAA_HIGHLIGHT", "0") == "1"
+BUY_SIGNAL_COLOR = "#40c057"
+SELL_SIGNAL_COLOR = "#fa5252"
+HOLD_SIGNAL_COLOR = "#868e96"
 
 def normalize_daily_state_columns(ds: pd.DataFrame) -> pd.DataFrame:
     """將不同來源的 daily_state 欄位語意統一：
@@ -90,55 +93,127 @@ def _initialize_app_logging():
     logger.info(f"日誌目錄: {os.path.abspath('analysis/log')}")
     return logger
 
-# --- Smart Leverage 輔助計算函式 ---
-def calculate_smart_leverage_equity(daily_state, df_target, safe_ticker="0050.TW"):
+# --- Smart Pledge 輔助計算函式 ---
+SMART_PLEDGE_DIP_CFG: Dict[str, float] = {
+    # 質押設定：初始質押約持有部位 60%，維持率目標落在 130%~200%
+    "initial_pledge_ratio": 0.60,
+    "maint_ratio_floor": 1.30,
+    "maint_ratio_ceiling": 2.00,
+    "margin_call_ratio": 1.30,
+    "maintenance_safety_buffer": 0.10,
+    "max_exposure": 3.50,
+    # 生存優先：質押週期 + 獲利降槓桿
+    "pledge_max_days": 252.0,
+    "pledge_reset_days": 1.0,
+    "profit_take_threshold": 0.25,
+    "profit_take_scale": 0.65,
+    "profit_take_hold_days": 20.0,
+    # 核心調節：波動率目標 + 趨勢 + 回撤
+    "target_annual_vol": 0.65,
+    "vol_window": 20.0,
+    "trend_ma": 60.0,
+    "trend_boost": 1.15,
+    "trend_cut": 0.70,
+    "dd_soft": -0.10,
+    "dd_hard": -0.18,
+    "dd_soft_scale": 0.75,
+    "dd_hard_scale": 0.50,
+    "smooth_span": 5.0,
+    # 低檔加槓桿（Dip Overlay）
+    "dip_entry_dd": -0.08,
+    "dip_floor_dd": -0.28,
+    "dip_rebound_ret": 0.0,
+    "dip_trend_floor": 0.92,
+    "dip_pledge_scale": 1.0,
+    # 調倉門檻（避免過度微調）
+    "rebalance_threshold": 0.05,
+    # 成本
+    "buy_fee_rate": 0.001425 * 0.3,
+    "sell_fee_rate": 0.001425 * 0.3,
+    "sell_tax_rate": 0.001,
+    "margin_rate_annual": 0.028,
+}
+
+SMART_PLEDGE_CARRY_CFG: Dict[str, float] = {
+    "base_pledge_ratio": 0.60,
+    "min_operating_pledge_ratio": 0.20,
+    "reset_pledge_ratio": 0.00,
+    "max_pledge_ratio": 0.60,
+    "max_exposure": 3.50,
+    "margin_rate_annual": 0.028,
+    "margin_call_ratio": 1.30,
+    "base_target_mr": 1.72,
+    "crisis_target_mr": 2.00,
+    "mr_soft_reduce": 1.60,
+    "mr_hard_reduce": 1.50,
+    "mr_emergency": 1.40,
+    "mr_rebuild_line": 1.80,
+    "carry_vol_window": 20.0,
+    "carry_target_annual_vol": 0.45,
+    "carry_trend_fast_ma": 60.0,
+    "carry_trend_slow_ma": 120.0,
+    "carry_dd_soft": -0.10,
+    "carry_dd_hard": -0.18,
+    "carry_dd_crisis": -0.25,
+    "stress_fixed_drop": 0.08,
+    "stress_atr_mult": 2.0,
+    "stress_q_window": 252.0,
+    "stress_q": 0.95,
+    "add_step": 0.03,
+    "reduce_step": 0.08,
+    "hard_reduce_step": 0.15,
+    "rebalance_threshold": 0.03,
+    "carry_max_days": 252.0,
+    "carry_rolloff_days": 20.0,
+    "carry_reset_days": 3.0,
+    "carry_reentry_wait_days": 5.0,
+    "buy_fee_rate": 0.001425 * 0.3,
+    "sell_fee_rate": 0.001425 * 0.3,
+    "sell_tax_rate": 0.001,
+}
+
+# 向下相容舊名稱
+SMART_PLEDGE_CFG = SMART_PLEDGE_DIP_CFG
+
+SMART_PLEDGE_MODE_OPTIONS = [
+    {"label": "SmartPledgeDipOverlay", "value": "dip_overlay"},
+    {"label": "SmartPledgeCarry", "value": "carry"},
+]
+DEFAULT_SMART_PLEDGE_MODE = "dip_overlay"
+
+
+def calculate_smart_leverage_equity(
+    daily_state,
+    df_target,
+    safe_ticker="0050.TW",
+    mode: str = DEFAULT_SMART_PLEDGE_MODE,
+    params: Optional[Dict[str, Any]] = None,
+):
     """
-    動態計算 Smart Leverage 權益曲線
-    將 daily_state 中的 Cash 部位模擬為持有 safe_ticker
+    Smart Leverage（自動質押槓桿）：
+    - 非現金改持 0050 的舊邏輯已移除。
+    - 初始質押比率預設 60%，維持率約束在 130%~200%，130% 視為追繳線。
+    - 依「波動率 / 趨勢 / 回撤」動態微調質押比率與槓桿倍數。
+    - 計入融資利息（年化 2.8%）與槓桿調整交易成本。
 
     Args:
-        daily_state: 原始的每日狀態 DataFrame (必須含 'w' 權重欄位)
-        df_target: 攻擊性資產的價格數據 (必須含 'close')
-        safe_ticker: 防守性資產的代碼 (預設 0050.TW)
+        daily_state: 原始每日狀態 (需含 w + equity/portfolio_value)
+        df_target: 目標資產價格 (需含 close)
+        safe_ticker: 舊參數，保留僅為相容，不再使用
 
     Returns:
-        修改後的 daily_state (包含重新計算的 equity, cash, position_value)
+        重新計算後的 daily_state（含 leverage_mult / borrow_cost 等欄位）
     """
+    _ = safe_ticker  # 相容舊呼叫簽名
+    mode_norm = str(mode or DEFAULT_SMART_PLEDGE_MODE).strip().lower()
+    if mode_norm == "carry":
+        return _run_smart_pledge_carry(daily_state=daily_state, df_target=df_target, params=params)
     try:
         if daily_state is None or daily_state.empty:
             return daily_state
         if "w" not in daily_state.columns:
-            logger.warning("Smart Leverage: daily_state 缺少 'w' 欄位，無法計算")
+            logger.warning("Smart Leverage: daily_state 缺少 'w' 欄位")
             return daily_state
-
-        safe_path = Path(f"data/{safe_ticker.replace(':', '_')}_data_raw.csv")
-
-        def _download_safe_history(start: str, end: Optional[str] = None) -> Optional[pd.DataFrame]:
-            logger.info("下載 %s 用於 Smart Leverage... (%s ~ %s)", safe_ticker, start, end or "latest")
-            df_safe_dl = yf.download(safe_ticker, start=start, end=end, auto_adjust=True, progress=False)
-            if df_safe_dl is None or df_safe_dl.empty:
-                return None
-            if isinstance(df_safe_dl.columns, pd.MultiIndex):
-                df_safe_dl.columns = [str(c[0]).strip().lower() for c in df_safe_dl.columns]
-            else:
-                df_safe_dl.columns = [str(c).strip().lower() for c in df_safe_dl.columns]
-            safe_path.parent.mkdir(parents=True, exist_ok=True)
-            df_safe_dl.to_csv(safe_path, encoding="utf-8")
-            return df_safe_dl
-
-        if not safe_path.exists():
-            df_safe_dl = _download_safe_history("2010-01-01")
-            if df_safe_dl is None:
-                logger.warning("Smart Leverage: 無法下載 %s，維持原始資料", safe_ticker)
-                return daily_state
-
-        try:
-            df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="cp950")
-            except UnicodeDecodeError:
-                df_safe = pd.read_csv(safe_path, index_col=0, parse_dates=False, encoding="latin1")
 
         def _normalize_idx(df: pd.DataFrame) -> pd.DataFrame:
             out = df.copy()
@@ -147,9 +222,7 @@ def calculate_smart_leverage_equity(daily_state, df_target, safe_ticker="0050.TW
             else:
                 out.columns = [str(c).strip().lower() for c in out.columns]
             if not isinstance(out.index, pd.DatetimeIndex):
-                idx_text = pd.Index(out.index).map(lambda x: str(x).strip())
-                date_mask = idx_text.str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
-                out.index = pd.to_datetime(idx_text.where(date_mask), errors="coerce")
+                out.index = pd.to_datetime(out.index, errors="coerce")
             if out.index.tz is not None:
                 out.index = out.index.tz_localize(None)
             out = out[out.index.notna()].sort_index()
@@ -157,127 +230,750 @@ def calculate_smart_leverage_equity(daily_state, df_target, safe_ticker="0050.TW
 
         ds_raw = _normalize_idx(daily_state)
         tgt = _normalize_idx(df_target if isinstance(df_target, pd.DataFrame) else pd.DataFrame())
-        safe = _normalize_idx(df_safe)
 
         if ds_raw.empty:
-            logger.warning("Smart Leverage: daily_state 日期索引無效，維持原始資料")
+            logger.warning("Smart Leverage: daily_state 索引無效")
             return daily_state
-
-        safe_needs_refresh = False
-        if "close" not in safe.columns or safe.empty:
-            safe_needs_refresh = True
-        else:
-            ds_min = ds_raw.index.min()
-            ds_max = ds_raw.index.max()
-            safe_min = safe.index.min()
-            safe_max = safe.index.max()
-            if (safe_min - ds_min).days > 5 or (ds_max - safe_max).days > 5:
-                safe_needs_refresh = True
-
-        if safe_needs_refresh:
-            refresh_start = min(ds_raw.index.min(), pd.Timestamp("2010-01-01")).strftime("%Y-%m-%d")
-            refresh_end = (ds_raw.index.max() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
-            safe_dl = _download_safe_history(refresh_start, refresh_end)
-            if safe_dl is not None and not safe_dl.empty:
-                safe = _normalize_idx(safe_dl)
-
         if "close" not in tgt.columns:
-            logger.warning("Smart Leverage: 目標資產缺少 close 欄位，維持原始資料")
-            return daily_state
-        if "close" not in safe.columns:
-            logger.warning("Smart Leverage: 防守資產缺少 close 欄位，維持原始資料")
+            logger.warning("Smart Leverage: 目標資產缺少 close 欄位")
             return daily_state
 
-        tgt_close = pd.to_numeric(tgt["close"], errors="coerce")
-        safe_close = pd.to_numeric(safe["close"], errors="coerce")
-        w_series = pd.to_numeric(ds_raw.get("w"), errors="coerce").clip(0.0, 1.0)
-
+        close_series = pd.to_numeric(tgt["close"], errors="coerce")
+        w_base = pd.to_numeric(ds_raw["w"], errors="coerce").clip(0.0, 1.0)
         equity_col = "equity" if "equity" in ds_raw.columns else ("portfolio_value" if "portfolio_value" in ds_raw.columns else None)
         if equity_col is None:
-            logger.warning("Smart Leverage: daily_state 缺少 equity/portfolio_value，維持原始資料")
+            logger.warning("Smart Leverage: daily_state 缺少 equity/portfolio_value")
             return daily_state
         equity_series = pd.to_numeric(ds_raw[equity_col], errors="coerce")
 
-        common_idx = ds_raw.index.intersection(tgt_close.index).intersection(safe_close.index)
-        common_idx = common_idx.sort_values()
+        common_idx = ds_raw.index.intersection(close_series.index).sort_values()
         if len(common_idx) < 2:
             logger.warning("Smart Leverage: 可用交集資料不足 (%d 筆)", len(common_idx))
             return daily_state
 
-        ds = ds_raw.reindex(common_idx).copy()
-        w_aligned = w_series.reindex(common_idx).ffill().fillna(0.0).clip(0.0, 1.0)
-        tgt_aligned = tgt_close.reindex(common_idx)
-        safe_aligned = safe_close.reindex(common_idx)
+        w_aligned = w_base.reindex(common_idx).ffill().fillna(0.0).clip(0.0, 1.0)
+        close_aligned = close_series.reindex(common_idx)
         eq_aligned = equity_series.reindex(common_idx).ffill()
 
-        valid_mask = tgt_aligned.notna() & safe_aligned.notna() & eq_aligned.notna() & w_aligned.notna()
+        valid_mask = w_aligned.notna() & close_aligned.notna() & eq_aligned.notna()
         valid_idx = common_idx[valid_mask]
         if len(valid_idx) < 2:
             logger.warning("Smart Leverage: 有效資料不足 (%d 筆)", len(valid_idx))
             return daily_state
 
-        ds = ds.loc[valid_idx].copy()
         w_aligned = w_aligned.loc[valid_idx]
-        tgt_aligned = tgt_aligned.loc[valid_idx]
-        safe_aligned = safe_aligned.loc[valid_idx]
+        close_aligned = close_aligned.loc[valid_idx]
         eq_aligned = eq_aligned.loc[valid_idx]
 
         initial_equity = float(eq_aligned.iloc[0])
         if not np.isfinite(initial_equity) or initial_equity <= 0:
-            logger.warning("Smart Leverage: 初始權益異常 (%s)，維持原始資料", initial_equity)
+            logger.warning("Smart Leverage: 初始權益異常 (%s)", initial_equity)
             return daily_state
 
-        r_target = tgt_aligned.pct_change().fillna(0.0)
-        r_safe = safe_aligned.pct_change().fillna(0.0)
+        cfg = dict(SMART_PLEDGE_CFG)
+        if isinstance(params, dict):
+            for k, v in params.items():
+                if k in cfg and v is not None:
+                    try:
+                        cfg[k] = float(v)
+                    except Exception:
+                        pass
+        r_asset = close_aligned.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        vol_window = int(max(cfg["vol_window"], 2.0))
+        vol_ann = r_asset.rolling(vol_window, min_periods=max(5, vol_window // 3)).std() * np.sqrt(252.0)
+        vol_fallback = float(vol_ann.dropna().median()) if not vol_ann.dropna().empty else float(cfg["target_annual_vol"])
+        vol_ann = vol_ann.replace(0.0, np.nan).ffill().fillna(vol_fallback).clip(lower=1e-6)
 
-        fee_rate = 0.001425 * 0.3
-        tax_rate = 0.001  # ETF 稅率：僅在賣出腿計入
+        risk_scale_from_vol = float(cfg["target_annual_vol"]) / vol_ann
+        trend_ma = close_aligned.rolling(int(max(cfg["trend_ma"], 2.0)), min_periods=5).mean()
+        trend_scale = pd.Series(
+            np.where(close_aligned >= trend_ma, float(cfg["trend_boost"]), float(cfg["trend_cut"])),
+            index=valid_idx,
+            dtype=float,
+        ).fillna(1.0)
 
-        smart_equity = np.full(len(valid_idx), np.nan, dtype=float)
-        smart_equity[0] = initial_equity
+        drawdown = close_aligned / close_aligned.cummax() - 1.0
+        dd_scale = pd.Series(1.0, index=valid_idx, dtype=float)
+        dd_scale = dd_scale.where(drawdown > float(cfg["dd_soft"]), float(cfg["dd_soft_scale"]))
+        dd_scale = dd_scale.where(drawdown > float(cfg["dd_hard"]), float(cfg["dd_hard_scale"]))
 
-        for i in range(1, len(valid_idx)):
+        # 先決定質押比例，再轉成總曝險倍率（exp = base_w * (1 + pledge_ratio)）
+        # 這裡的質押比定義為「借款 / 自有持倉擔保品」，60% 對應維持率約 1/0.6 = 166.7%
+        margin_call_ratio = max(float(cfg.get("margin_call_ratio", 1.30)), 1.01)
+        safety_buffer = max(float(cfg.get("maintenance_safety_buffer", 0.0)), 0.0)
+        maint_floor = max(float(cfg["maint_ratio_floor"]), margin_call_ratio + safety_buffer, 1.01)
+        maint_ceiling = max(float(cfg["maint_ratio_ceiling"]), maint_floor + 0.01)
+        pledge_min = 1.0 / maint_ceiling   # 維持率 200% -> 50% 質押
+        pledge_max = 1.0 / maint_floor     # 維持率 130% -> 約 76.9% 質押
+        initial_pledge = float(cfg["initial_pledge_ratio"])
+        initial_pledge = float(np.clip(initial_pledge, pledge_min, pledge_max))
+
+        pledge_target = (initial_pledge * risk_scale_from_vol * trend_scale * dd_scale).clip(
+            lower=pledge_min,
+            upper=pledge_max,
+        )
+        pledge_target = pledge_target.ewm(span=int(max(cfg["smooth_span"], 1.0)), adjust=False).mean().clip(
+            lower=pledge_min,
+            upper=pledge_max,
+        )
+        maintenance_target = (1.0 / pledge_target).clip(lower=maint_floor, upper=maint_ceiling)
+        lev_target = 1.0 + pledge_target
+        trend_ratio = (close_aligned / trend_ma.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        leveraged_target = w_aligned * lev_target
+        dip_entry_dd = float(cfg.get("dip_entry_dd", -0.08))
+        dip_floor_dd = float(cfg.get("dip_floor_dd", -0.28))
+        dip_rebound_ret = float(cfg.get("dip_rebound_ret", 0.0))
+        dip_trend_floor = float(cfg.get("dip_trend_floor", 0.92))
+        dip_scale = float(np.clip(float(cfg.get("dip_pledge_scale", 1.0)), 0.0, 1.2))
+        dip_zone = (drawdown <= dip_entry_dd) & (drawdown >= dip_floor_dd)
+        rebound_ok = r_asset >= dip_rebound_ret
+        trend_ok = trend_ratio >= dip_trend_floor
+        leverage_gate = (dip_zone & rebound_ok & trend_ok).fillna(False)
+        leveraged_target = w_aligned * (1.0 + pledge_target * dip_scale)
+
+        exposure_target = pd.Series(
+            np.where(leverage_gate, leveraged_target, w_aligned),
+            index=valid_idx,
+            dtype=float,
+        ).clip(lower=0.0, upper=float(cfg["max_exposure"]))
+
+        n = len(valid_idx)
+        smart_equity = np.full(n, np.nan, dtype=float)
+        exposure_applied = np.full(n, 0.0, dtype=float)
+        leverage_applied = np.full(n, 0.0, dtype=float)
+        rebalance_cost = np.zeros(n, dtype=float)
+        borrow_cost = np.zeros(n, dtype=float)
+        borrow_balance = np.zeros(n, dtype=float)
+        pledge_cycle_days = np.zeros(n, dtype=int)
+        pledge_reset_active = np.zeros(n, dtype=bool)
+        pledge_reset_trigger = np.zeros(n, dtype=bool)
+        profit_take_active = np.zeros(n, dtype=bool)
+        profit_take_trigger = np.zeros(n, dtype=bool)
+        profit_take_return = np.zeros(n, dtype=float)
+
+        margin_daily = float(cfg["margin_rate_annual"]) / 252.0
+        rb_th = float(cfg["rebalance_threshold"])
+        buy_fee = float(cfg["buy_fee_rate"])
+        sell_fee = float(cfg["sell_fee_rate"])
+        sell_tax = float(cfg["sell_tax_rate"])
+        eps = 1e-10
+
+        pledge_max_days = int(max(float(cfg.get("pledge_max_days", 252.0)), 1.0))
+        pledge_reset_days = int(max(float(cfg.get("pledge_reset_days", 1.0)), 1.0))
+        profit_take_threshold = float(cfg.get("profit_take_threshold", 0.25))
+        profit_take_scale = float(np.clip(float(cfg.get("profit_take_scale", 0.65)), 0.0, 1.0))
+        profit_take_hold_days = int(max(float(cfg.get("profit_take_hold_days", 20.0)), 0.0))
+        max_exposure = float(cfg["max_exposure"])
+
+        # t0 先從基礎部位切到 smart 目標，補扣首筆調倉成本
+        base_w0 = float(w_aligned.iloc[0])
+        exp0 = float(np.clip(exposure_target.iloc[0], 0.0, max_exposure))
+        delta0 = exp0 - base_w0
+        traded0 = abs(delta0) * initial_equity
+        if delta0 > eps:
+            rb0 = traded0 * buy_fee
+        elif delta0 < -eps:
+            rb0 = traded0 * (sell_fee + sell_tax)
+        else:
+            rb0 = 0.0
+        smart_equity[0] = max(initial_equity - rb0, 0.0)
+        exposure_applied[0] = exp0
+        rebalance_cost[0] = rb0
+        borrow_balance[0] = max(exp0 - base_w0, 0.0) * initial_equity if exp0 > (base_w0 + eps) else 0.0
+        leverage_applied[0] = float(exp0 / base_w0) if base_w0 > eps else 0.0
+
+        # 週期狀態：質押最長 1 年，滿期後先還款再重開；達標獲利後暫時降低槓桿
+        cycle_start_equity = smart_equity[0]
+        pledge_days = 1 if borrow_balance[0] > eps else 0
+        reset_countdown = 0
+        profit_take_countdown = 0
+        pledge_cycle_days[0] = pledge_days
+
+        for i in range(1, n):
             prev_eq = float(smart_equity[i - 1])
             if not np.isfinite(prev_eq) or prev_eq <= 0:
                 smart_equity[i] = prev_eq
+                exposure_applied[i] = exposure_applied[i - 1]
+                leverage_applied[i] = leverage_applied[i - 1]
+                borrow_balance[i] = borrow_balance[i - 1]
+                pledge_cycle_days[i] = pledge_cycle_days[i - 1]
                 continue
 
-            w_prev = float(w_aligned.iloc[i - 1])
-            w_curr = float(w_aligned.iloc[i])
-            turnover = abs(w_curr - w_prev)
+            prev_exp = float(exposure_applied[i - 1])
+            base_w_i = float(w_aligned.iloc[i])
+            prev_borrow_balance = float(borrow_balance[i - 1])
+            prev_borrow_active = prev_borrow_balance > eps
 
-            rebalance_cost = 0.0
-            if turnover > 1e-9:
-                trade_notional = turnover * prev_eq
-                # 在攻擊/防守兩資產間換倉：一買一賣，雙邊手續費 + 賣出端交易稅。
-                rebalance_cost = trade_notional * (2.0 * fee_rate + tax_rate)
+            cycle_ret = 0.0
+            if np.isfinite(cycle_start_equity) and cycle_start_equity > 0:
+                cycle_ret = float(prev_eq / cycle_start_equity - 1.0)
+            profit_take_return[i] = cycle_ret
 
-            eq_after_cost = max(prev_eq - rebalance_cost, 0.0)
-            combined_ret = w_curr * float(r_target.iloc[i]) + (1.0 - w_curr) * float(r_safe.iloc[i])
-            smart_equity[i] = eq_after_cost * (1.0 + combined_ret)
+            force_reset_today = False
+            if prev_borrow_active and pledge_days >= pledge_max_days and reset_countdown <= 0:
+                # 到期強制先償還（去槓桿），下一輪再允許重新質押
+                reset_countdown = pledge_reset_days
+                force_reset_today = True
+                pledge_reset_trigger[i] = True
+                pledge_days = 0
+                profit_take_countdown = 0
+                cycle_start_equity = prev_eq
 
-        ds["w"] = w_aligned
-        ds["equity"] = smart_equity
+            if (
+                not force_reset_today
+                and reset_countdown <= 0
+                and prev_borrow_active
+                and profit_take_hold_days > 0
+                and profit_take_countdown <= 0
+                and cycle_ret >= profit_take_threshold
+            ):
+                profit_take_countdown = profit_take_hold_days
+                profit_take_trigger[i] = True
+
+            tgt_exp_raw = float(exposure_target.iloc[i])
+            leveraged_part = max(tgt_exp_raw - base_w_i, 0.0)
+            reset_active_today = False
+            profit_take_active_today = False
+
+            if reset_countdown > 0:
+                # reset 期間只保留基礎部位，等同先還款
+                tgt_exp = base_w_i
+                reset_active_today = True
+                reset_countdown -= 1
+                profit_take_countdown = 0
+            else:
+                if profit_take_countdown > 0 and leveraged_part > eps:
+                    leveraged_part *= profit_take_scale
+                    profit_take_active_today = True
+                    profit_take_countdown -= 1
+                tgt_exp = base_w_i + leveraged_part
+
+            force_flat_today = base_w_i <= eps
+            if force_flat_today:
+                tgt_exp = 0.0
+
+            tgt_exp = float(np.clip(tgt_exp, 0.0, max_exposure))
+            delta_exp = tgt_exp - prev_exp
+            force_rebalance = bool(force_flat_today or reset_active_today or force_reset_today)
+
+            if (not force_rebalance) and abs(delta_exp) < rb_th:
+                new_exp = prev_exp
+                delta_exec = 0.0
+            else:
+                new_exp = tgt_exp
+                delta_exec = delta_exp
+
+            traded_notional = abs(delta_exec) * prev_eq
+            if delta_exec > eps:
+                rb_cost = traded_notional * buy_fee
+            elif delta_exec < -eps:
+                rb_cost = traded_notional * (sell_fee + sell_tax)
+            else:
+                rb_cost = 0.0
+
+            # 借款本金台帳：未成交日保持不變；強制清空/去槓桿時歸零
+            if force_flat_today or new_exp <= (base_w_i + eps):
+                borrow_balance_i = 0.0
+            elif abs(delta_exec) > eps or force_rebalance:
+                borrow_balance_i = max(new_exp - base_w_i, 0.0) * prev_eq
+            else:
+                borrow_balance_i = prev_borrow_balance
+
+            # 利息以借款本金計，不再直接綁定當日 equity 比例
+            interest_cost = borrow_balance_i * margin_daily
+            eq_after_cost = max(prev_eq - rb_cost - interest_cost, 0.0)
+            day_ret = float(r_asset.iloc[i]) if np.isfinite(r_asset.iloc[i]) else 0.0
+            smart_equity[i] = max(eq_after_cost * (1.0 + new_exp * day_ret), 0.0)
+
+            exposure_applied[i] = new_exp
+            rebalance_cost[i] = rb_cost
+            borrow_cost[i] = interest_cost
+            borrow_balance[i] = borrow_balance_i
+            leverage_applied[i] = float(new_exp / base_w_i) if base_w_i > eps else 0.0
+            pledge_reset_active[i] = reset_active_today
+            profit_take_active[i] = profit_take_active_today
+
+            new_borrow_active = borrow_balance_i > eps
+            if reset_active_today or not new_borrow_active:
+                if prev_borrow_active and not reset_active_today:
+                    cycle_start_equity = smart_equity[i] if np.isfinite(smart_equity[i]) else prev_eq
+                pledge_days = 0
+                if not new_borrow_active:
+                    profit_take_countdown = 0
+            else:
+                if prev_borrow_active:
+                    pledge_days += 1
+                else:
+                    pledge_days = 1
+                    cycle_start_equity = smart_equity[i] if np.isfinite(smart_equity[i]) else prev_eq
+            pledge_cycle_days[i] = pledge_days
+
+        ds = ds_raw.reindex(valid_idx).copy()
+        ds["w_base"] = w_aligned
+        ds["w_target"] = exposure_target
+        ds["w"] = pd.Series(exposure_applied, index=valid_idx, dtype=float)
+        ds["leverage_gate"] = pd.Series(leverage_gate, index=valid_idx, dtype=bool)
+        ds["smart_pledge_mode"] = "dip_overlay"
+        ds["leverage_mult_target"] = lev_target
+        ds["leverage_mult"] = pd.Series(leverage_applied, index=valid_idx, dtype=float)
+        ds["pledge_ratio_target"] = pledge_target
+        ds["maintenance_ratio_target"] = maintenance_target
+        ds["rebalance_cost"] = pd.Series(rebalance_cost, index=valid_idx, dtype=float)
+        ds["borrow_cost"] = pd.Series(borrow_cost, index=valid_idx, dtype=float)
+        ds["pledge_cycle_days"] = pd.Series(pledge_cycle_days, index=valid_idx, dtype=int)
+        ds["pledge_reset_active"] = pd.Series(pledge_reset_active, index=valid_idx, dtype=bool)
+        ds["pledge_reset_trigger"] = pd.Series(pledge_reset_trigger, index=valid_idx, dtype=bool)
+        ds["profit_take_active"] = pd.Series(profit_take_active, index=valid_idx, dtype=bool)
+        ds["profit_take_trigger"] = pd.Series(profit_take_trigger, index=valid_idx, dtype=bool)
+        ds["profit_take_return"] = pd.Series(profit_take_return, index=valid_idx, dtype=float)
+
+        ds["equity"] = pd.Series(smart_equity, index=valid_idx, dtype=float)
         if "portfolio_value" in ds.columns:
             ds["portfolio_value"] = ds["equity"]
-        ds["cash"] = ds["equity"] * (1.0 - ds["w"])
-        ds["position_value"] = ds["equity"] * ds["w"]
-        total = ds["equity"].replace(0.0, np.nan)
-        ds["invested_pct"] = (ds["position_value"] / total).fillna(0.0).clip(0.0, 1.0)
-        ds["cash_pct"] = (ds["cash"] / total).fillna(0.0).clip(0.0, 1.0)
 
+        ds["position_value"] = ds["equity"] * ds["w"]
+        ds["cash"] = ds["equity"] - ds["position_value"]  # 可能為負，代表融資
+        ds["borrow_value"] = pd.Series(borrow_balance, index=valid_idx, dtype=float)
+        ds["collateral_value"] = np.maximum(ds["w_base"], 0.0) * ds["equity"]
+        ds["invested_pct"] = ds["w"]
+        ds["cash_pct"] = 1.0 - ds["w"]
+        ds["borrow_pct"] = np.where(ds["equity"] > 1e-8, ds["borrow_value"] / ds["equity"], 0.0)
+        borrow_active_mask = ds["borrow_value"] > 1e-6
+        ds["maintenance_ratio"] = np.where(borrow_active_mask, ds["collateral_value"] / ds["borrow_value"], np.nan)
+        ds["maintenance_ratio_pct"] = ds["maintenance_ratio"] * 100.0
+        ds["margin_call_trigger"] = (ds["maintenance_ratio"] < margin_call_ratio).fillna(False)
+        ds["stress_maintenance_ratio"] = np.nan
+        ds["stress_breach_trigger"] = False
+        ds["carry_rolloff_active"] = False
+        ds["carry_rolloff_trigger"] = False
+        ds["carry_reentry_wait_active"] = False
+        ds["carry_cycle_paused_or_reset"] = False
+
+        active = w_aligned > 1e-8
+        avg_lev = float(ds.loc[active, "leverage_mult"].mean()) if active.any() else 0.0
+        maint_series = ds["maintenance_ratio"].replace([np.inf, -np.inf], np.nan).dropna()
+        maint_for_stats = maint_series[(maint_series >= margin_call_ratio * 0.5) & (maint_series <= 20.0)]
+        if maint_for_stats.empty:
+            maint_for_stats = maint_series
+        avg_maint = float(maint_for_stats.mean()) if not maint_for_stats.empty else float("nan")
+        call_days = int(ds["margin_call_trigger"].sum()) if "margin_call_trigger" in ds.columns else 0
+        reset_days = int(ds["pledge_reset_active"].sum()) if "pledge_reset_active" in ds.columns else 0
+        profit_take_events = int(ds["profit_take_trigger"].sum()) if "profit_take_trigger" in ds.columns else 0
+        ds["call_days_actual"] = call_days
+        ds["stress_breach_days"] = 0
+        ds["stress_mr_min"] = float("nan")
         logger.info(
-            "✅ Smart Leverage 計算完成 (使用 %s，區間 %s ~ %s，最終權益: %s)",
-            safe_ticker,
+            "✅ SmartPledgeDipOverlay 完成：%s ~ %s，最終權益=%s，平均槓桿=%.2fx，平均維持率=%.1f%%，追繳天數=%d，到期重置天數=%d，獲利降槓桿事件=%d",
             valid_idx[0].date(),
             valid_idx[-1].date(),
             f"{smart_equity[-1]:,.0f}",
+            avg_lev,
+            avg_maint * 100.0 if np.isfinite(avg_maint) else float("nan"),
+            call_days,
+            reset_days,
+            profit_take_events,
         )
         return ds
 
     except Exception:
         logger.exception("❌ Smart Leverage 計算失敗")
         return daily_state
+
+
+def _normalize_idx_for_smart(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [str(c[0]).strip().lower() for c in out.columns]
+    else:
+        out.columns = [str(c).strip().lower() for c in out.columns]
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, errors="coerce")
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out = out[out.index.notna()].sort_index()
+    return out
+
+
+def _merge_smart_cfg(default_cfg: Dict[str, float], params: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    cfg = dict(default_cfg)
+    if isinstance(params, dict):
+        for k, v in params.items():
+            if k not in cfg or v is None:
+                continue
+            try:
+                cfg[k] = float(v)
+            except Exception:
+                continue
+    return cfg
+
+
+def _run_smart_pledge_carry(daily_state, df_target, params: Optional[Dict[str, Any]] = None):
+    """SmartPledgeCarry：長期持有槓桿，優先生存與維持率控制。"""
+    try:
+        if daily_state is None or daily_state.empty:
+            return daily_state
+        if "w" not in daily_state.columns:
+            logger.warning("SmartPledgeCarry: daily_state 缺少 'w' 欄位")
+            return daily_state
+
+        ds_raw = _normalize_idx_for_smart(daily_state)
+        tgt = _normalize_idx_for_smart(df_target if isinstance(df_target, pd.DataFrame) else pd.DataFrame())
+        if ds_raw.empty or "close" not in tgt.columns:
+            return daily_state
+
+        close = pd.to_numeric(tgt["close"], errors="coerce")
+        high = pd.to_numeric(tgt.get("high", close), errors="coerce")
+        low = pd.to_numeric(tgt.get("low", close), errors="coerce")
+        w_base = pd.to_numeric(ds_raw["w"], errors="coerce").clip(0.0, 1.0)
+        eq_col = "equity" if "equity" in ds_raw.columns else ("portfolio_value" if "portfolio_value" in ds_raw.columns else None)
+        if eq_col is None:
+            return daily_state
+        eq_series = pd.to_numeric(ds_raw[eq_col], errors="coerce")
+
+        idx = ds_raw.index.intersection(close.index).sort_values()
+        if len(idx) < 2:
+            return daily_state
+        w = w_base.reindex(idx).ffill().fillna(0.0).clip(0.0, 1.0)
+        c = close.reindex(idx)
+        h = high.reindex(idx).fillna(c)
+        l = low.reindex(idx).fillna(c)
+        e = eq_series.reindex(idx).ffill()
+        mask = w.notna() & c.notna() & h.notna() & l.notna() & e.notna()
+        idx = idx[mask]
+        if len(idx) < 2:
+            return daily_state
+        w = w.loc[idx]
+        c = c.loc[idx]
+        h = h.loc[idx]
+        l = l.loc[idx]
+        e = e.loc[idx]
+
+        init_eq = float(e.iloc[0])
+        if not np.isfinite(init_eq) or init_eq <= 0:
+            return daily_state
+
+        cfg = _merge_smart_cfg(SMART_PLEDGE_CARRY_CFG, params)
+        eps = 1e-10
+        ret = c.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        vol = ret.rolling(int(max(cfg["carry_vol_window"], 2.0)), min_periods=5).std() * np.sqrt(252.0)
+        vol = vol.replace(0.0, np.nan).ffill().fillna(float(cfg["carry_target_annual_vol"])).clip(lower=1e-6)
+        ma_fast = c.rolling(int(max(cfg["carry_trend_fast_ma"], 2.0)), min_periods=5).mean()
+        ma_slow = c.rolling(int(max(cfg["carry_trend_slow_ma"], 2.0)), min_periods=5).mean()
+        dd = c / c.cummax() - 1.0
+
+        prev_c = c.shift(1).fillna(c)
+        tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(20, min_periods=5).mean().bfill().fillna(0.0)
+        atr_pct = (atr / c.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        q_drop = (-ret).clip(lower=0.0).rolling(int(max(cfg["stress_q_window"], 20.0)), min_periods=20).quantile(float(np.clip(cfg["stress_q"], 0.5, 0.999))).fillna(0.0)
+        stress_drop = pd.concat(
+            [pd.Series(float(cfg["stress_fixed_drop"]), index=idx), atr_pct * float(cfg["stress_atr_mult"]), q_drop],
+            axis=1,
+        ).max(axis=1).clip(lower=0.0, upper=0.95)
+
+        base_pledge = float(np.clip(cfg["base_pledge_ratio"], 0.0, 3.0))
+        min_op_pledge = float(np.clip(cfg["min_operating_pledge_ratio"], 0.0, 3.0))
+        # reset_pledge_ratio 為實際可調參數（建議預設 0），避免 UI/引擎口徑不一致
+        reset_pledge = float(np.clip(cfg.get("reset_pledge_ratio", 0.0), 0.0, min(min_op_pledge, 3.0)))
+        max_pledge = float(np.clip(cfg["max_pledge_ratio"], min_op_pledge, 3.0))
+        margin_call = max(float(cfg["margin_call_ratio"]), 1.01)
+        mr_soft = float(cfg["mr_soft_reduce"])
+        mr_hard = float(cfg["mr_hard_reduce"])
+        mr_emg = float(cfg["mr_emergency"])
+        mr_rebuild = float(cfg["mr_rebuild_line"])
+        base_target_mr = float(cfg["base_target_mr"])
+        crisis_target_mr = max(float(cfg["crisis_target_mr"]), base_target_mr)
+        target_vol = float(cfg["carry_target_annual_vol"])
+        rb_th = float(cfg["rebalance_threshold"])
+        buy_fee = float(cfg["buy_fee_rate"])
+        sell_fee = float(cfg["sell_fee_rate"])
+        sell_tax = float(cfg["sell_tax_rate"])
+        margin_daily = float(cfg["margin_rate_annual"]) / 252.0
+        max_exp = float(cfg["max_exposure"])
+        carry_max_days = int(max(float(cfg["carry_max_days"]), 1.0))
+        rolloff_days = int(max(float(cfg["carry_rolloff_days"]), 1.0))
+        reset_days = int(max(float(cfg["carry_reset_days"]), 1.0))
+        reentry_days = int(max(float(cfg["carry_reentry_wait_days"]), 0.0))
+
+        n = len(idx)
+        eq = np.full(n, np.nan, dtype=float)
+        exp = np.zeros(n, dtype=float)
+        rb_cost = np.zeros(n, dtype=float)
+        int_cost = np.zeros(n, dtype=float)
+        borrow_balance = np.zeros(n, dtype=float)
+        pledge_target = np.zeros(n, dtype=float)
+        maint_target = np.full(n, np.nan, dtype=float)
+        stress_maint = np.full(n, np.nan, dtype=float)
+        cycle_days = np.zeros(n, dtype=int)
+        reset_active = np.zeros(n, dtype=bool)
+        reset_trigger = np.zeros(n, dtype=bool)
+        reentry_active = np.zeros(n, dtype=bool)
+        rolloff_active = np.zeros(n, dtype=bool)
+        rolloff_trigger = np.zeros(n, dtype=bool)
+        paused_or_reset = np.zeros(n, dtype=bool)
+        stress_breach = np.zeros(n, dtype=bool)
+
+        current_pledge = float(np.clip(base_pledge, min_op_pledge, max_pledge))
+        base_w0 = float(w.iloc[0])
+        if base_w0 <= eps:
+            paused_or_reset[0] = True
+            current_pledge = reset_pledge
+        exp0 = 0.0 if base_w0 <= eps else float(np.clip(base_w0 * (1.0 + current_pledge), 0.0, max_exp))
+        delta0 = exp0 - base_w0
+        traded0 = abs(delta0) * init_eq
+        if delta0 > eps:
+            trade_cost0 = traded0 * buy_fee
+        elif delta0 < -eps:
+            trade_cost0 = traded0 * (sell_fee + sell_tax)
+        else:
+            trade_cost0 = 0.0
+        eq[0] = max(init_eq - trade_cost0, 0.0)
+        exp[0] = exp0
+        rb_cost[0] = trade_cost0
+        borrow_balance[0] = max(exp0 - base_w0, 0.0) * init_eq if exp0 > (base_w0 + eps) else 0.0
+        pledge_target[0] = current_pledge
+        maint_target[0] = (1.0 / current_pledge) if current_pledge > eps else np.nan
+        collateral0 = max(base_w0, 0.0) * eq[0]
+        if borrow_balance[0] > eps:
+            stress_maint[0] = (collateral0 * (1.0 - float(stress_drop.iloc[0]))) / borrow_balance[0]
+        else:
+            stress_maint[0] = np.nan
+        stress_breach[0] = bool(np.isfinite(stress_maint[0]) and stress_maint[0] < mr_soft)
+        cycle_day = 1 if (base_w0 > eps and borrow_balance[0] > eps) else 0
+        cycle_days[0] = cycle_day
+        reset_countdown = 0
+        reentry_countdown = 0
+
+        for i in range(1, n):
+            prev_eq = float(eq[i - 1])
+            if not np.isfinite(prev_eq) or prev_eq <= 0:
+                eq[i] = prev_eq
+                exp[i] = exp[i - 1]
+                borrow_balance[i] = borrow_balance[i - 1]
+                pledge_target[i] = pledge_target[i - 1]
+                maint_target[i] = maint_target[i - 1]
+                stress_maint[i] = stress_maint[i - 1]
+                stress_breach[i] = stress_breach[i - 1]
+                cycle_days[i] = cycle_days[i - 1]
+                continue
+
+            prev_exp = float(exp[i - 1])
+            base_w_i = float(w.iloc[i])
+            prev_borrow_balance = float(borrow_balance[i - 1])
+            prev_borrow = prev_borrow_balance > eps
+            stress_drop_i = float(stress_drop.iloc[i]) if np.isfinite(stress_drop.iloc[i]) else float(cfg["stress_fixed_drop"])
+
+            if base_w_i <= eps:
+                target_pledge_i = reset_pledge
+                paused_or_reset[i] = True
+                cycle_day = 0
+                reset_countdown = 0
+                reentry_countdown = 0
+            else:
+                days_to_reset = carry_max_days - cycle_day if cycle_day > 0 else carry_max_days
+                target_mr = base_target_mr
+                if float(vol.iloc[i]) > target_vol:
+                    target_mr += 0.08
+                if not bool(c.iloc[i] >= ma_fast.iloc[i]):
+                    target_mr += 0.08
+                if not bool(c.iloc[i] >= ma_slow.iloc[i]):
+                    target_mr += 0.12
+                if float(dd.iloc[i]) <= float(cfg["carry_dd_soft"]):
+                    target_mr += 0.05
+                if float(dd.iloc[i]) <= float(cfg["carry_dd_hard"]):
+                    target_mr += 0.10
+                if float(dd.iloc[i]) <= float(cfg["carry_dd_crisis"]):
+                    target_mr += 0.20
+                if days_to_reset <= rolloff_days:
+                    target_mr += 0.15
+                target_mr = float(np.clip(target_mr, base_target_mr, crisis_target_mr))
+                raw_pledge = float(np.clip(1.0 / max(target_mr, 1.01), min_op_pledge, max_pledge))
+                vol_scale = float(np.clip(target_vol / max(float(vol.iloc[i]), 1e-6), 0.65, 1.05))
+                trend_scale = 1.0 if c.iloc[i] >= ma_fast.iloc[i] and c.iloc[i] >= ma_slow.iloc[i] else (0.90 if c.iloc[i] >= ma_fast.iloc[i] else 0.75)
+                dd_i = float(dd.iloc[i])
+                dd_scale = 1.0 if dd_i > float(cfg["carry_dd_soft"]) else (0.90 if dd_i > float(cfg["carry_dd_hard"]) else (0.75 if dd_i > float(cfg["carry_dd_crisis"]) else 0.55))
+                raw_pledge = float(np.clip(raw_pledge * vol_scale * trend_scale * dd_scale, min_op_pledge, max_pledge))
+
+                if days_to_reset <= rolloff_days:
+                    rolloff_active[i] = True
+                    raw_pledge = min(raw_pledge, base_pledge * max(days_to_reset / float(rolloff_days), 0.0))
+
+                collateral_now = max(base_w_i, 0.0) * prev_eq
+                if prev_borrow_balance > eps:
+                    mr_now = collateral_now / prev_borrow_balance
+                    stress_mr_now = (collateral_now * (1.0 - stress_drop_i)) / prev_borrow_balance
+                else:
+                    mr_now = np.nan
+                    stress_mr_now = np.nan
+                if cycle_day >= carry_max_days and reset_countdown <= 0:
+                    target_pledge_i = reset_pledge
+                    reset_trigger[i] = True
+                    paused_or_reset[i] = True
+                    reset_countdown = reset_days
+                    reentry_countdown = reentry_days
+                    cycle_day = 0
+                    if rolloff_active[i]:
+                        rolloff_trigger[i] = True
+                elif reset_countdown > 0:
+                    target_pledge_i = reset_pledge
+                    reset_active[i] = True
+                    paused_or_reset[i] = True
+                    reset_countdown -= 1
+                elif reentry_countdown > 0:
+                    target_pledge_i = min(current_pledge, raw_pledge)
+                    reentry_active[i] = True
+                    reentry_countdown -= 1
+                else:
+                    if not np.isfinite(stress_mr_now):
+                        # 無既有借款時（例如第一段 base_w=0 後重新進場），允許逐步建立 Carry 借款，
+                        # 避免 current_pledge=0 被 min(current, raw) 永久鎖死。
+                        target_pledge_i = min(max_pledge, min(raw_pledge, current_pledge + float(cfg["add_step"])))
+                    elif stress_mr_now < mr_emg:
+                        target_pledge_i = max(min_op_pledge, current_pledge - float(cfg["hard_reduce_step"]))
+                    elif stress_mr_now < mr_hard:
+                        target_pledge_i = max(min_op_pledge, min(raw_pledge, current_pledge - float(cfg["hard_reduce_step"])))
+                    elif stress_mr_now < mr_soft:
+                        target_pledge_i = max(min_op_pledge, min(raw_pledge, current_pledge - float(cfg["reduce_step"])))
+                    elif stress_mr_now > mr_rebuild:
+                        target_pledge_i = min(max_pledge, min(raw_pledge, current_pledge + float(cfg["add_step"])))
+                    else:
+                        target_pledge_i = min(current_pledge, raw_pledge)
+
+            target_pledge_i = float(np.clip(target_pledge_i, reset_pledge, max_pledge))
+            force_rebalance = bool(base_w_i <= eps or reset_trigger[i] or reset_active[i] or paused_or_reset[i])
+            if abs(target_pledge_i - current_pledge) < rb_th:
+                target_pledge_i = current_pledge
+
+            target_exp = 0.0 if base_w_i <= eps else float(np.clip(base_w_i * (1.0 + target_pledge_i), 0.0, max_exp))
+            delta = target_exp - prev_exp
+            if (not force_rebalance) and abs(delta) < rb_th:
+                new_exp, delta_exec = prev_exp, 0.0
+            else:
+                new_exp, delta_exec = target_exp, delta
+
+            notional = abs(delta_exec) * prev_eq
+            if delta_exec > eps:
+                trade_cost = notional * buy_fee
+            elif delta_exec < -eps:
+                trade_cost = notional * (sell_fee + sell_tax)
+            else:
+                trade_cost = 0.0
+
+            if base_w_i <= eps or new_exp <= (base_w_i + eps):
+                borrow_i = 0.0
+            elif abs(delta_exec) > eps or force_rebalance:
+                borrow_i = max(new_exp - base_w_i, 0.0) * prev_eq
+            else:
+                borrow_i = prev_borrow_balance
+
+            interest = borrow_i * margin_daily
+            eq_after = max(prev_eq - trade_cost - interest, 0.0)
+            day_ret = float(ret.iloc[i]) if np.isfinite(ret.iloc[i]) else 0.0
+            eq[i] = max(eq_after * (1.0 + new_exp * day_ret), 0.0)
+            exp[i] = new_exp
+            rb_cost[i] = trade_cost
+            int_cost[i] = interest
+            borrow_balance[i] = borrow_i
+
+            if base_w_i > eps:
+                current_pledge = max(float(new_exp / base_w_i - 1.0), 0.0)
+                current_pledge = float(np.clip(current_pledge, reset_pledge, max_pledge))
+            else:
+                current_pledge = reset_pledge
+            pledge_target[i] = current_pledge
+            maint_target[i] = (1.0 / current_pledge) if current_pledge > eps else np.nan
+            collateral_i = max(base_w_i, 0.0) * eq[i]
+            if borrow_i > eps:
+                stress_maint[i] = (collateral_i * (1.0 - stress_drop_i)) / borrow_i
+            else:
+                stress_maint[i] = np.nan
+            stress_breach[i] = bool(np.isfinite(stress_maint[i]) and stress_maint[i] < mr_soft)
+
+            new_borrow = borrow_i > eps
+            if base_w_i <= eps or reset_active[i] or paused_or_reset[i]:
+                cycle_day = 0
+            elif new_borrow:
+                cycle_day = cycle_day + 1 if (prev_borrow and cycle_day > 0) else 1
+            else:
+                cycle_day = 0
+            cycle_days[i] = cycle_day
+
+        ds = ds_raw.reindex(idx).copy()
+        ds["smart_pledge_mode"] = "carry"
+        ds["w_base"] = w
+        ds["w_target"] = pd.Series(np.maximum(0.0, np.minimum(max_exp, w * (1.0 + pledge_target))), index=idx, dtype=float)
+        ds["w"] = pd.Series(exp, index=idx, dtype=float)
+        ds["leverage_gate"] = (w > eps)
+        ds["leverage_mult_target"] = 1.0 + pd.Series(pledge_target, index=idx, dtype=float)
+        ds["leverage_mult"] = np.where(w > eps, ds["w"] / w, 0.0)
+        ds["pledge_ratio_target"] = pd.Series(pledge_target, index=idx, dtype=float)
+        ds["maintenance_ratio_target"] = pd.Series(maint_target, index=idx, dtype=float)
+        ds["rebalance_cost"] = pd.Series(rb_cost, index=idx, dtype=float)
+        ds["borrow_cost"] = pd.Series(int_cost, index=idx, dtype=float)
+        ds["pledge_cycle_days"] = pd.Series(cycle_days, index=idx, dtype=int)
+        ds["pledge_reset_active"] = pd.Series(reset_active, index=idx, dtype=bool)
+        ds["pledge_reset_trigger"] = pd.Series(reset_trigger, index=idx, dtype=bool)
+        ds["profit_take_active"] = False
+        ds["profit_take_trigger"] = False
+        ds["profit_take_return"] = 0.0
+        ds["carry_reentry_wait_active"] = pd.Series(reentry_active, index=idx, dtype=bool)
+        ds["carry_rolloff_active"] = pd.Series(rolloff_active, index=idx, dtype=bool)
+        ds["carry_rolloff_trigger"] = pd.Series(rolloff_trigger, index=idx, dtype=bool)
+        ds["carry_cycle_paused_or_reset"] = pd.Series(paused_or_reset, index=idx, dtype=bool)
+        ds["stress_maintenance_ratio"] = pd.Series(stress_maint, index=idx, dtype=float)
+        ds["stress_breach_trigger"] = pd.Series(stress_breach, index=idx, dtype=bool)
+
+        ds["equity"] = pd.Series(eq, index=idx, dtype=float)
+        if "portfolio_value" in ds.columns:
+            ds["portfolio_value"] = ds["equity"]
+        ds["position_value"] = ds["equity"] * ds["w"]
+        ds["cash"] = ds["equity"] - ds["position_value"]
+        ds["borrow_value"] = pd.Series(borrow_balance, index=idx, dtype=float)
+        ds["collateral_value"] = np.maximum(ds["w_base"], 0.0) * ds["equity"]
+        ds["invested_pct"] = ds["w"]
+        ds["cash_pct"] = 1.0 - ds["w"]
+        ds["borrow_pct"] = np.where(ds["equity"] > 1e-8, ds["borrow_value"] / ds["equity"], 0.0)
+        borrow_mask = ds["borrow_value"] > 1e-6
+        ds["maintenance_ratio"] = np.where(borrow_mask, ds["collateral_value"] / ds["borrow_value"], np.nan)
+        ds["maintenance_ratio_pct"] = ds["maintenance_ratio"] * 100.0
+        ds["margin_call_trigger"] = (ds["maintenance_ratio"] < margin_call).fillna(False)
+        ds["call_days_actual"] = int(ds["margin_call_trigger"].sum())
+        ds["stress_breach_days"] = int(ds["stress_breach_trigger"].sum())
+        stress_vals = pd.to_numeric(ds["stress_maintenance_ratio"], errors="coerce").dropna()
+        ds["stress_mr_min"] = float(stress_vals.min()) if not stress_vals.empty else float("nan")
+
+        logger.info(
+            "✅ SmartPledgeCarry 完成：%s ~ %s，最終權益=%s，追繳天數=%d，壓力破線天數=%d",
+            idx[0].date(),
+            idx[-1].date(),
+            f"{eq[-1]:,.0f}",
+            int(ds["call_days_actual"].iloc[-1]),
+            int(ds["stress_breach_days"].iloc[-1]),
+        )
+        return ds
+    except Exception:
+        logger.exception("❌ SmartPledgeCarry 計算失敗")
+        return daily_state
+
+
+def calculate_smart_pledge_equity(
+    daily_state,
+    df_target,
+    mode: str = DEFAULT_SMART_PLEDGE_MODE,
+    params: Optional[Dict[str, Any]] = None,
+    safe_ticker: str = "0050.TW",
+):
+    _ = safe_ticker
+    mode_norm = str(mode or DEFAULT_SMART_PLEDGE_MODE).strip().lower()
+    if mode_norm == "carry":
+        return _run_smart_pledge_carry(daily_state=daily_state, df_target=df_target, params=params)
+    return calculate_smart_leverage_equity(
+        daily_state=daily_state,
+        df_target=df_target,
+        safe_ticker=safe_ticker,
+        mode="dip_overlay",
+        params=params,
+    )
 
 def plot_trade_returns_bar(trades_df):
     """
@@ -1091,7 +1787,7 @@ def _create_daily_smaa_threshold_figure(
                     y=pd.to_numeric(ind["buy_threshold"], errors="coerce"),
                     name="買入閥值",
                     mode="lines",
-                    line=dict(color="#40c057", width=1.2, dash="dot"),
+                    line=dict(color=BUY_SIGNAL_COLOR, width=1.2, dash="dot"),
                 )
             )
         if "sell_threshold" in ind.columns:
@@ -1101,7 +1797,7 @@ def _create_daily_smaa_threshold_figure(
                     y=pd.to_numeric(ind["sell_threshold"], errors="coerce"),
                     name="賣出閥值",
                     mode="lines",
-                    line=dict(color="#fa5252", width=1.2, dash="dash"),
+                    line=dict(color=SELL_SIGNAL_COLOR, width=1.2, dash="dash"),
                 )
             )
     elif stype == "ssma_turn" and "prom_threshold" in ind.columns:
@@ -2052,7 +2748,7 @@ def _create_crash_xray_figure(
             x=df.index,
             y=np.full(len(df), min_hits, dtype=float),
             name="min_hits",
-            line=dict(color="#ff6b6b", width=1.5, dash="dash"),
+            line=dict(color=SELL_SIGNAL_COLOR, width=1.5, dash="dash"),
         ),
         row=1,
         col=1,
@@ -2069,7 +2765,7 @@ def _create_crash_xray_figure(
         col=1,
     )
     if np.isfinite(day_drop_th):
-        fig.add_hline(y=day_drop_th, line_color="#fa5252", line_width=1, line_dash="dash", row=2, col=1)
+        fig.add_hline(y=day_drop_th, line_color=SELL_SIGNAL_COLOR, line_width=1, line_dash="dash", row=2, col=1)
     fig.add_trace(
         go.Bar(
             x=df.index,
@@ -2092,7 +2788,7 @@ def _create_crash_xray_figure(
         col=1,
     )
     if np.isfinite(breadth_th):
-        fig.add_hline(y=breadth_th, line_color="#fa5252", line_width=1, line_dash="dash", row=3, col=1)
+        fig.add_hline(y=breadth_th, line_color=SELL_SIGNAL_COLOR, line_width=1, line_dash="dash", row=3, col=1)
     fig.add_trace(
         go.Bar(
             x=df.index,
@@ -2115,7 +2811,7 @@ def _create_crash_xray_figure(
         col=1,
     )
     if np.isfinite(limit_net_th):
-        fig.add_hline(y=limit_net_th, line_color="#fa5252", line_width=1, line_dash="dash", row=4, col=1)
+        fig.add_hline(y=limit_net_th, line_color=SELL_SIGNAL_COLOR, line_width=1, line_dash="dash", row=4, col=1)
     fig.add_trace(
         go.Bar(
             x=df.index,
@@ -2138,7 +2834,7 @@ def _create_crash_xray_figure(
         col=1,
     )
     if np.isfinite(tv_ratio_th):
-        fig.add_hline(y=tv_ratio_th, line_color="#fa5252", line_width=1, line_dash="dash", row=5, col=1)
+        fig.add_hline(y=tv_ratio_th, line_color=SELL_SIGNAL_COLOR, line_width=1, line_dash="dash", row=5, col=1)
     fig.add_trace(
         go.Bar(
             x=df.index,
@@ -2624,17 +3320,30 @@ def format_trade_like_df_for_display(df):
     d = d.rename(columns={k: DISPLAY_NAME.get(k, k) for k in d.columns})
     return d
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.DARKLY],
+    suppress_callback_exceptions=True,
+    # 關閉瀏覽器分頁標題「Updating...」閃爍，避免誤判為重算
+    update_title=None,
+)
 
 # --------- Dash Layout ---------
 app.layout = html.Div([
     dcc.Store(id='theme-store', data='theme-dark'),
+    dcc.Store(id='header-panel-store', data='basic'),
 
     # === Header Controls ===
     html.Div([
         html.Button(id='theme-toggle', n_clicks=0, children='🌑 深色主題', className='btn btn-secondary main-header-bar'),
         html.Button(id='history-btn', n_clicks=0, children='📚 版本沿革', className='btn btn-secondary main-header-bar ms-2'),
-    ], className='header-controls'),
+        html.Button(id='header-btn-basic', n_clicks=0, children='🧩 基礎設定', className='btn btn-outline-light main-header-bar ms-2'),
+        html.Button(id='header-btn-crash', n_clicks=0, children='🚨 Crash', className='btn btn-outline-warning main-header-bar ms-2'),
+        html.Button(id='header-btn-ensemble', n_clicks=0, children='📊 Ensemble', className='btn btn-outline-info main-header-bar ms-2'),
+        html.Button(id='header-btn-smartpledge', n_clicks=0, children='🧠 Smart Pledge', className='btn btn-outline-success main-header-bar ms-2'),
+        html.Div(style={'flex': '1 1 auto'}),
+        html.Button("🚀 一鍵執行所有回測", id='run-btn', n_clicks=0, className="btn btn-primary main-header-bar ms-2"),
+    ], className='header-controls', style={'display': 'flex', 'alignItems': 'center', 'flexWrap': 'wrap'}),
 
     # 版本沿革模態框
     dbc.Modal([
@@ -2650,150 +3359,323 @@ app.layout = html.Div([
     # === Top Control Bar (代替側邊欄) ===
     dbc.Container([
         # Row 1: 基本回測參數
-        dbc.Row(id='ctrl-row-basic', children=[
-            dbc.Col([
-                html.Label("股票代號", className="small mb-1"),
-                dcc.Dropdown(id='ticker-dropdown', options=[{'label': t, 'value': t} for t in default_tickers],
-                            value=default_tickers[0]),
-            ], width=2),
-            dbc.Col([
-                html.Label("起始日期", className="small mb-1"),
-                dcc.Input(id='start-date', type='text', value='2010-01-01'),
-            ], width=1),
-            dbc.Col([
-                html.Label("結束日期", className="small mb-1"),
-                dcc.Input(id='end-date', type='text', value='', placeholder='留空=最新'),
-            ], width=1),
-            dbc.Col([
-                html.Label("券商折數", className="small mb-1"),
-                dcc.Slider(id='discount-slider', min=0.1, max=0.7, step=0.01, value=0.3,
-                          marks={0.1:'0.1',0.3:'0.3',0.5:'0.5',0.7:'0.7'},
-                          tooltip={"placement": "bottom", "always_visible": True}),
-            ], width=3),
-            dbc.Col([
-                html.Label("冷卻期 (bars)", className="small mb-1"),
-                dcc.Input(id='cooldown-bars', type='number', min=0, max=20, value=3, style={'width': '70px'}),
-            ], width=1),
-            dbc.Col([
-                html.Div([
-                    dbc.Checkbox(id='bad-holding', value=False, label="賣出報酬率<-20%,等待下次賣點", className="small"),
-                    dbc.Checkbox(id='auto-run', value=True, label="自動運算（參數變動即回測）", className="small mt-1"),
-                    html.Label("勾選要隱藏的策略", className="small mt-2 mb-1"),
-                    html.Div(
-                        dbc.Checklist(
-                            id='hide-strategy-presets',
-                            options=hide_strategy_options,
-                            value=hide_strategy_defaults,
-                            inline=False,
-                            className="small",
-                        ),
-                        style={
-                            "maxHeight": "70px",
-                            "overflowY": "auto",
-                            "border": "1px solid #3a3a3a",
-                            "padding": "6px",
-                            "borderRadius": "6px",
-                        },
-                    ),
-                ]),
-            ], width=4),
-        ], className='p-2 mb-2', style={'borderRadius': '4px'}),
-
-        # === 展開/收合按鈕 ===
-        html.Div([
-            dbc.Button(
-                "⚙️ 顯示/隱藏 進階參數 (Crash Overlay、策略倉庫、Ensemble)",
-                id="collapse-button",
-                className="mb-2 w-100",
-                color="secondary",
-                outline=True,
-                size="sm",
-                n_clicks=0,
-            ),
-        ]),
-
-        # === Collapsible Area: 包裹 Row 2 & Row 3 ===
-        dbc.Collapse(
-            id="collapse-settings",
-            is_open=False,  # 預設關閉
+        html.Div(
+            id='ctrl-row-basic',
+            className='p-2 mb-2',
+            style={'borderRadius': '4px'},
             children=[
-                # Row 2: 風險控制（保留 Crash Overlay / Smart Leverage）
-                dbc.Row(id='ctrl-row-risk', children=[
-                    dbc.Col([
-                        html.Label("🔧 風險控制", id='label-risk-title', className="small mb-1 fw-bold"),
-                        html.Label("測試選項", className="small mb-1"),
-                        dbc.Checkbox(id='smart-leverage-switch', value=False, label="Smart Leverage (0050代替現金)", className="small text-success fw-bold"),
-                        dbc.Checkbox(id='crash-overlay-switch', value=False, label="Crash-only Overlay", className="small text-warning fw-bold mt-1"),
-                        dcc.Dropdown(
-                            id='crash-overlay-preset',
-                            options=CRASH_OVERLAY_PRESET_OPTIONS,
-                            value=DEFAULT_CRASH_OVERLAY_PRESET,
-                            clearable=False,
-                            style={"marginTop": "4px", "fontSize": "12px"},
+                dbc.Row(
+                    className='g-2 align-items-end',
+                    children=[
+                        dbc.Col([
+                            html.Label("股票代號", className="small mb-1"),
+                            dcc.Dropdown(
+                                id='ticker-dropdown',
+                                options=[{'label': t, 'value': t} for t in default_tickers],
+                                value=default_tickers[0],
+                            ),
+                        ], width=3),
+                        dbc.Col([
+                            html.Label("起始日期", className="small mb-1"),
+                            dcc.Input(id='start-date', type='text', value='2010-01-01', style={'width': '100%'}),
+                        ], width=2),
+                        dbc.Col([
+                            html.Label("結束日期", className="small mb-1"),
+                            dcc.Input(id='end-date', type='text', value='', placeholder='留空=最新', style={'width': '100%'}),
+                        ], width=2),
+                        dbc.Col([
+                            html.Label("券商折數", className="small mb-1"),
+                            dcc.Slider(
+                                id='discount-slider',
+                                min=0.1,
+                                max=0.7,
+                                step=0.01,
+                                value=0.3,
+                                marks={0.1: '0.1', 0.3: '0.3', 0.5: '0.5', 0.7: '0.7'},
+                                tooltip={"placement": "bottom", "always_visible": True},
+                            ),
+                        ], width=3),
+                        dbc.Col([
+                            html.Label("冷卻期 (bars)", className="small mb-1"),
+                            dcc.Input(id='cooldown-bars', type='number', min=0, max=20, value=3, style={'width': '100%'}),
+                        ], width=1),
+                        dbc.Col([
+                            html.Label("自動運算", className="small mb-1"),
+                            dbc.Checkbox(id='auto-run', value=True, label="參數變動即回測", className="small"),
+                        ], width=1),
+                    ],
+                ),
+                dbc.Row(
+                    className='g-2 align-items-end mt-1',
+                    children=[
+                        dbc.Col([
+                            html.Label("次要條件", className="small mb-1"),
+                            dbc.Checkbox(
+                                id='bad-holding',
+                                value=False,
+                                label="賣出報酬率<-20%,等待下次賣點",
+                                className="small",
+                            ),
+                        ], width=3),
+                        dbc.Col([
+                            html.Label("勾選要隱藏的策略", className="small mb-1"),
+                            html.Div(
+                                dbc.Checklist(
+                                    id='hide-strategy-presets',
+                                    options=hide_strategy_options,
+                                    value=hide_strategy_defaults,
+                                    inline=False,
+                                    className="small",
+                                ),
+                                style={
+                                    "maxHeight": "88px",
+                                    "overflowY": "auto",
+                                    "border": "1px solid #3a3a3a",
+                                    "padding": "6px",
+                                    "borderRadius": "6px",
+                                },
+                            ),
+                        ], width=9),
+                    ],
+                ),
+            ],
+        ),
+
+        # === Top Control Bar 保留區（顯示內容由 Header Buttons + store 控制） ===
+        html.Div(
+            id="advanced-panel-shell",
+            className="mb-2",
+            children=[
+                html.Div(
+                    id="advanced-panel-empty-hint",
+                    children="請由 Header Buttons 在 基礎設定 / Crash / Ensemble / Smart Pledge 之間切換。",
+                    className="small",
+                    style={
+                        "padding": "8px 10px",
+                        "borderRadius": "6px",
+                        "opacity": 0.9,
+                    },
+                ),
+                # Crash Panel
+                dbc.Row(
+                    id='ctrl-row-risk',
+                    children=[
+                        dbc.Col(
+                            [
+                                html.Label("🚨 Crash Overlay", id='label-risk-title', className="small mb-1 fw-bold"),
+                                dbc.Checkbox(
+                                    id='crash-overlay-switch',
+                                    value=False,
+                                    label="Crash-only Overlay",
+                                    className="small text-warning fw-bold mt-1",
+                                ),
+                                dcc.Dropdown(
+                                    id='crash-overlay-preset',
+                                    options=CRASH_OVERLAY_PRESET_OPTIONS,
+                                    value=DEFAULT_CRASH_OVERLAY_PRESET,
+                                    clearable=False,
+                                    style={"marginTop": "4px", "fontSize": "12px"},
+                                ),
+                                html.Div(
+                                    "Crash 只改覆蓋權重，不改基礎策略訊號；交易原因會標記 crash_overlay_*。",
+                                    style={"fontSize": "12px", "opacity": 0.85, "marginTop": "6px"},
+                                ),
+                            ],
+                            width=12,
                         ),
-                    ], width=12),
-                ], className='p-2 mb-2', style={'borderRadius': '4px'}),
-
-                # Row 3: 策略倉庫 & 兩組 Ensemble 參數 + 執行按鈕
-                dbc.Row(id='ctrl-row-ensemble', children=[
-                    # 倉庫選擇
-                    dbc.Col([
-                        html.Label("📂 策略倉庫版本", className="small mb-1 fw-bold"),
-                        dcc.Dropdown(id='warehouse-dropdown', options=warehouse_options, value='strategy_warehouse.json'),
-                    ], width=2),
-
-                    # Ensemble_Majority 參數 (藍色)
-                    dbc.Col([
-                        html.Label("📊 Ensemble Majority", id='label-maj-title', className="small mb-1 fw-bold"),
-                        html.Div([
-                            html.Span("floor:", className="small me-1"),
-                            dcc.Input(id='majority-floor', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
-                                     style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("ema:", className="small me-1"),
-                            dcc.Input(id='majority-ema-span', type='number', min=1, max=20, step=1, value=3,
-                                     style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("Δcap:", className="small me-1"),
-                            dcc.Input(id='majority-delta-cap', type='number', min=0.0, max=1.0, step=0.05, value=0.3,
-                                     style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("cool:", className="small me-1"),
-                            dcc.Input(id='majority-min-cooldown', type='number', min=0, max=30, step=1, value=3,
-                                     style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("dw:", className="small me-1"),
-                            dcc.Input(id='majority-min-trade-dw', type='number', min=0.0, max=0.5, step=0.01, value=0.05,
-                                     style={'width': '55px', 'display': 'inline-block'}),
-                        ], style={'whiteSpace': 'nowrap'}),
-                    ], width=4),
-
-                    # Ensemble_Proportional 參數 (綠色)
-                    dbc.Col([
-                        html.Label("📈 Ensemble Proportional", id='label-prop-title', className="small mb-1 fw-bold"),
-                        html.Div([
-                            html.Span("floor:", className="small me-1"),
-                            dcc.Input(id='prop-floor', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
-                                     style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("ema:", className="small me-1"),
-                            dcc.Input(id='prop-ema-span', type='number', min=1, max=20, step=1, value=3,
-                                     style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("Δcap:", className="small me-1"),
-                            dcc.Input(id='prop-delta-cap', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
-                                     style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("cool:", className="small me-1"),
-                            dcc.Input(id='prop-min-cooldown', type='number', min=0, max=30, step=1, value=3,
-                                     style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
-                            html.Span("dw:", className="small me-1"),
-                            dcc.Input(id='prop-min-trade-dw', type='number', min=0.0, max=0.5, step=0.01, value=0.03,
-                                     style={'width': '55px', 'display': 'inline-block'}),
-                        ], style={'whiteSpace': 'nowrap'}),
-                    ], width=4),
-
-                    # 執行按鈕
-                    dbc.Col([
-                        html.Label("\u00A0", className="small mb-1"),
-                        html.Button("🚀 一鍵執行所有回測", id='run-btn', n_clicks=0, className="btn btn-primary w-100"),
-                    ], width=2),
-                ], className='p-2 mb-2', style={'borderRadius': '4px'}),
-            ]  # 結束 Collapse children
-        ),  # 結束 Collapse
+                    ],
+                    className='p-2 mb-2',
+                    style={'borderRadius': '4px'},
+                ),
+                # Ensemble Panel
+                dbc.Row(
+                    id='ctrl-row-ensemble',
+                    children=[
+                        dbc.Col([
+                            html.Label("📂 策略倉庫版本", className="small mb-1 fw-bold"),
+                            dcc.Dropdown(id='warehouse-dropdown', options=warehouse_options, value='strategy_warehouse.json'),
+                        ], width=2),
+                        dbc.Col([
+                            html.Label("📊 Ensemble Majority", id='label-maj-title', className="small mb-1 fw-bold"),
+                            html.Div([
+                                html.Span("floor:", className="small me-1"),
+                                dcc.Input(id='majority-floor', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
+                                         style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("ema:", className="small me-1"),
+                                dcc.Input(id='majority-ema-span', type='number', min=1, max=20, step=1, value=3,
+                                         style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("Δcap:", className="small me-1"),
+                                dcc.Input(id='majority-delta-cap', type='number', min=0.0, max=1.0, step=0.05, value=0.3,
+                                         style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("cool:", className="small me-1"),
+                                dcc.Input(id='majority-min-cooldown', type='number', min=0, max=30, step=1, value=3,
+                                         style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("dw:", className="small me-1"),
+                                dcc.Input(id='majority-min-trade-dw', type='number', min=0.0, max=0.5, step=0.01, value=0.05,
+                                         style={'width': '55px', 'display': 'inline-block'}),
+                            ], style={'whiteSpace': 'nowrap'}),
+                        ], width=5),
+                        dbc.Col([
+                            html.Label("📈 Ensemble Proportional", id='label-prop-title', className="small mb-1 fw-bold"),
+                            html.Div([
+                                html.Span("floor:", className="small me-1"),
+                                dcc.Input(id='prop-floor', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
+                                         style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("ema:", className="small me-1"),
+                                dcc.Input(id='prop-ema-span', type='number', min=1, max=20, step=1, value=3,
+                                         style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("Δcap:", className="small me-1"),
+                                dcc.Input(id='prop-delta-cap', type='number', min=0.0, max=1.0, step=0.05, value=0.2,
+                                         style={'width': '55px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("cool:", className="small me-1"),
+                                dcc.Input(id='prop-min-cooldown', type='number', min=0, max=30, step=1, value=3,
+                                         style={'width': '50px', 'display': 'inline-block', 'marginRight': '8px'}),
+                                html.Span("dw:", className="small me-1"),
+                                dcc.Input(id='prop-min-trade-dw', type='number', min=0.0, max=0.5, step=0.01, value=0.03,
+                                         style={'width': '55px', 'display': 'inline-block'}),
+                            ], style={'whiteSpace': 'nowrap'}),
+                        ], width=5),
+                    ],
+                    className='p-2 mb-2',
+                    style={'borderRadius': '4px'},
+                ),
+                # Smart Pledge Panel
+                dbc.Row(
+                    id='ctrl-row-smartpledge',
+                    children=[
+                        dbc.Col(
+                            [
+                                html.Label("🧠 Smart Pledge", id='label-smart-title', className="small mb-1 fw-bold"),
+                                dbc.Checkbox(
+                                    id='smart-leverage-switch',
+                                    value=False,
+                                    label="啟用 Smart Pledge",
+                                    className="small text-success fw-bold",
+                                ),
+                                dcc.Dropdown(
+                                    id='smart-pledge-mode',
+                                    options=SMART_PLEDGE_MODE_OPTIONS,
+                                    value=DEFAULT_SMART_PLEDGE_MODE,
+                                    clearable=False,
+                                    style={"fontSize": "12px"},
+                                ),
+                                html.Div(
+                                    id='smart-pledge-desc',
+                                    children="Dip 與 Carry 為完全分流引擎；由 Header 按鈕切換，不共用同一套條件敘述。",
+                                    style={"fontSize": "12px", "marginTop": "8px", "opacity": 0.85},
+                                ),
+                            ],
+                            width=3,
+                        ),
+                        dbc.Col(
+                            [
+                                html.Div(
+                                    id='smart-dip-panel',
+                                    children=[
+                                        html.Div("SmartPledgeDipOverlay（低檔反彈放大，保留 profit_take）", className="small fw-bold mb-1"),
+                                        html.Div([
+                                            html.Span("initial:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-initial-pledge-ratio', type='number', min=0, max=3, step=0.01, value=SMART_PLEDGE_DIP_CFG["initial_pledge_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("call:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-margin-call-ratio', type='number', min=1.0, max=3, step=0.01, value=SMART_PLEDGE_DIP_CFG["margin_call_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("buffer:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-maint-safety-buffer', type='number', min=0, max=1, step=0.01, value=SMART_PLEDGE_DIP_CFG["maintenance_safety_buffer"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("vol:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-target-annual-vol', type='number', min=0.1, max=2, step=0.01, value=SMART_PLEDGE_DIP_CFG["target_annual_vol"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("ma:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-trend-ma', type='number', min=5, max=240, step=1, value=SMART_PLEDGE_DIP_CFG["trend_ma"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap', 'marginBottom': '6px'}),
+                                        html.Div([
+                                            html.Span("entry_dd:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-entry-dd', type='number', min=-0.8, max=0, step=0.01, value=SMART_PLEDGE_DIP_CFG["dip_entry_dd"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("floor_dd:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-floor-dd', type='number', min=-0.9, max=0, step=0.01, value=SMART_PLEDGE_DIP_CFG["dip_floor_dd"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("rebound:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-rebound-ret', type='number', min=-0.2, max=0.2, step=0.001, value=SMART_PLEDGE_DIP_CFG["dip_rebound_ret"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("trend_floor:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-trend-floor', type='number', min=0.5, max=1.2, step=0.01, value=SMART_PLEDGE_DIP_CFG["dip_trend_floor"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("scale:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-pledge-scale', type='number', min=0, max=2, step=0.01, value=SMART_PLEDGE_DIP_CFG["dip_pledge_scale"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap', 'marginBottom': '6px'}),
+                                        html.Div([
+                                            html.Span("max_days:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-max-days', type='number', min=1, max=504, step=1, value=SMART_PLEDGE_DIP_CFG["pledge_max_days"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("pt_th:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-profit-take-th', type='number', min=0, max=1.5, step=0.01, value=SMART_PLEDGE_DIP_CFG["profit_take_threshold"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("pt_scale:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-profit-take-scale', type='number', min=0, max=1, step=0.01, value=SMART_PLEDGE_DIP_CFG["profit_take_scale"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("pt_hold:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-profit-take-hold', type='number', min=0, max=120, step=1, value=SMART_PLEDGE_DIP_CFG["profit_take_hold_days"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("rate:", className="small me-1"),
+                                            dcc.Input(id='smart-dip-margin-rate', type='number', min=0, max=0.2, step=0.0005, value=SMART_PLEDGE_DIP_CFG["margin_rate_annual"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap'}),
+                                    ],
+                                ),
+                                html.Div(
+                                    id='smart-carry-panel',
+                                    children=[
+                                        html.Div("SmartPledgeCarry（長期控維持率，reset 期間借款歸零）", className="small fw-bold mb-1"),
+                                        html.Div([
+                                            html.Span("base:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-base-pledge', type='number', min=0, max=2, step=0.01, value=SMART_PLEDGE_CARRY_CFG["base_pledge_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("min_op:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-min-op-pledge', type='number', min=0, max=2, step=0.01, value=SMART_PLEDGE_CARRY_CFG["min_operating_pledge_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("reset:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-reset-pledge', type='number', min=0, max=2, step=0.01, value=SMART_PLEDGE_CARRY_CFG["reset_pledge_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("max:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-max-pledge', type='number', min=0, max=2, step=0.01, value=SMART_PLEDGE_CARRY_CFG["max_pledge_ratio"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("call:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-margin-call', type='number', min=1.0, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["margin_call_ratio"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap', 'marginBottom': '6px'}),
+                                        html.Div([
+                                            html.Span("mr_base:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-base-target-mr', type='number', min=1.1, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["base_target_mr"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("soft:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-mr-soft', type='number', min=1.1, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["mr_soft_reduce"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("hard:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-mr-hard', type='number', min=1.1, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["mr_hard_reduce"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("emg:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-mr-emg', type='number', min=1.1, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["mr_emergency"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("rebuild:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-mr-rebuild', type='number', min=1.1, max=3, step=0.01, value=SMART_PLEDGE_CARRY_CFG["mr_rebuild_line"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap', 'marginBottom': '6px'}),
+                                        html.Div([
+                                            html.Span("vol:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-target-vol', type='number', min=0.1, max=2, step=0.01, value=SMART_PLEDGE_CARRY_CFG["carry_target_annual_vol"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("stress_fix:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-stress-fixed', type='number', min=0, max=0.5, step=0.005, value=SMART_PLEDGE_CARRY_CFG["stress_fixed_drop"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("atr_mult:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-stress-atr-mult', type='number', min=0.5, max=5, step=0.1, value=SMART_PLEDGE_CARRY_CFG["stress_atr_mult"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("max_days:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-max-days', type='number', min=1, max=504, step=1, value=SMART_PLEDGE_CARRY_CFG["carry_max_days"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("rolloff:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-rolloff-days', type='number', min=1, max=120, step=1, value=SMART_PLEDGE_CARRY_CFG["carry_rolloff_days"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap', 'marginBottom': '6px'}),
+                                        html.Div([
+                                            html.Span("reset_days:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-reset-days', type='number', min=1, max=60, step=1, value=SMART_PLEDGE_CARRY_CFG["carry_reset_days"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("reentry:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-reentry-days', type='number', min=0, max=60, step=1, value=SMART_PLEDGE_CARRY_CFG["carry_reentry_wait_days"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("add:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-add-step', type='number', min=0, max=1, step=0.005, value=SMART_PLEDGE_CARRY_CFG["add_step"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("reduce:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-reduce-step', type='number', min=0, max=1, step=0.005, value=SMART_PLEDGE_CARRY_CFG["reduce_step"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("hard:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-hard-reduce-step', type='number', min=0, max=1, step=0.005, value=SMART_PLEDGE_CARRY_CFG["hard_reduce_step"], style={'width': '70px', 'marginRight': '8px'}),
+                                            html.Span("rate:", className="small me-1"),
+                                            dcc.Input(id='smart-carry-margin-rate', type='number', min=0, max=0.2, step=0.0005, value=SMART_PLEDGE_CARRY_CFG["margin_rate_annual"], style={'width': '70px'}),
+                                        ], style={'whiteSpace': 'nowrap'}),
+                                    ],
+                                ),
+                            ],
+                            width=9,
+                        ),
+                    ],
+                    className='p-2 mb-2',
+                    style={'borderRadius': '4px'},
+                ),
+            ],
+        ),
 
     ], fluid=True, className='mb-3'),
 
@@ -2822,17 +3704,46 @@ app.layout = html.Div([
 
 ], id='main-bg', className='theme-dark')
 
-# --------- 進階參數區塊 展開/收合控制 ---------
+# --------- Header Controls: 進階面板切換 ---------
 @app.callback(
-    Output("collapse-settings", "is_open"),
-    [Input("collapse-button", "n_clicks")],
-    [State("collapse-settings", "is_open")],
+    Output("header-panel-store", "data"),
+    Input("header-btn-basic", "n_clicks"),
+    Input("header-btn-crash", "n_clicks"),
+    Input("header-btn-ensemble", "n_clicks"),
+    Input("header-btn-smartpledge", "n_clicks"),
+    State("header-panel-store", "data"),
 )
-def toggle_advanced_settings(n, is_open):
-    """控制進階參數區塊的展開/收合"""
-    if n:
-        return not is_open
-    return is_open
+def toggle_header_panel(btn_basic, btn_crash, btn_ensemble, btn_smart, current_panel):
+    current = str(current_panel or "none")
+    trigger = ctx.triggered_id
+    target_map = {
+        "header-btn-basic": "basic",
+        "header-btn-crash": "crash",
+        "header-btn-ensemble": "ensemble",
+        "header-btn-smartpledge": "smart",
+    }
+    target = target_map.get(str(trigger or ""))
+    if target is None:
+        return current if current in {"basic", "crash", "ensemble", "smart"} else "basic"
+    # 同一面板重複點擊時不改 store，避免不必要 callback 鏈更新
+    if current == target:
+        return no_update
+    return target
+
+
+@app.callback(
+    Output("smart-dip-panel", "style"),
+    Output("smart-carry-panel", "style"),
+    Output("smart-pledge-desc", "children"),
+    Input("smart-pledge-mode", "value"),
+)
+def toggle_smart_pledge_mode_panel(mode):
+    mode_norm = str(mode or DEFAULT_SMART_PLEDGE_MODE).strip().lower()
+    mode_text = "SmartPledgeCarry" if mode_norm == "carry" else "SmartPledgeDipOverlay"
+    dip_style = {"display": "none"} if mode_norm == "carry" else {"display": "block"}
+    carry_style = {"display": "block"} if mode_norm == "carry" else {"display": "none"}
+    desc = f"目前運算模式：{mode_text}"
+    return dip_style, carry_style, desc
 
 # --------- 倉庫列表更新 ---------
 @app.callback(
@@ -3377,15 +4288,96 @@ def run_backtest(n_clicks, auto_run, hidden_strategy_presets, ticker, start_date
     Input('main-tabs', 'value'),
     Input('theme-store', 'data'),
     Input('smart-leverage-switch', 'value'),  # 🔥 新增 Smart Leverage 開關
+    Input('smart-pledge-mode', 'value'),
+    Input('smart-dip-initial-pledge-ratio', 'value'),
+    Input('smart-dip-margin-call-ratio', 'value'),
+    Input('smart-dip-maint-safety-buffer', 'value'),
+    Input('smart-dip-target-annual-vol', 'value'),
+    Input('smart-dip-trend-ma', 'value'),
+    Input('smart-dip-entry-dd', 'value'),
+    Input('smart-dip-floor-dd', 'value'),
+    Input('smart-dip-rebound-ret', 'value'),
+    Input('smart-dip-trend-floor', 'value'),
+    Input('smart-dip-pledge-scale', 'value'),
+    Input('smart-dip-max-days', 'value'),
+    Input('smart-dip-profit-take-th', 'value'),
+    Input('smart-dip-profit-take-scale', 'value'),
+    Input('smart-dip-profit-take-hold', 'value'),
+    Input('smart-dip-margin-rate', 'value'),
+    Input('smart-carry-base-pledge', 'value'),
+    Input('smart-carry-min-op-pledge', 'value'),
+    Input('smart-carry-reset-pledge', 'value'),
+    Input('smart-carry-max-pledge', 'value'),
+    Input('smart-carry-margin-call', 'value'),
+    Input('smart-carry-base-target-mr', 'value'),
+    Input('smart-carry-mr-soft', 'value'),
+    Input('smart-carry-mr-hard', 'value'),
+    Input('smart-carry-mr-emg', 'value'),
+    Input('smart-carry-mr-rebuild', 'value'),
+    Input('smart-carry-target-vol', 'value'),
+    Input('smart-carry-stress-fixed', 'value'),
+    Input('smart-carry-stress-atr-mult', 'value'),
+    Input('smart-carry-max-days', 'value'),
+    Input('smart-carry-rolloff-days', 'value'),
+    Input('smart-carry-reset-days', 'value'),
+    Input('smart-carry-reentry-days', 'value'),
+    Input('smart-carry-add-step', 'value'),
+    Input('smart-carry-reduce-step', 'value'),
+    Input('smart-carry-hard-reduce-step', 'value'),
+    Input('smart-carry-margin-rate', 'value'),
     Input('hide-strategy-presets', 'value'),
     Input('ticker-dropdown', 'value'),
 )
-def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, ticker_for_daily):
+def update_tab(
+    data,
+    tab,
+    theme,
+    smart_leverage_on,
+    smart_pledge_mode,
+    dip_initial_pledge_ratio,
+    dip_margin_call_ratio,
+    dip_maint_safety_buffer,
+    dip_target_annual_vol,
+    dip_trend_ma,
+    dip_entry_dd,
+    dip_floor_dd,
+    dip_rebound_ret,
+    dip_trend_floor,
+    dip_pledge_scale,
+    dip_max_days,
+    dip_profit_take_th,
+    dip_profit_take_scale,
+    dip_profit_take_hold,
+    dip_margin_rate,
+    carry_base_pledge,
+    carry_min_op_pledge,
+    carry_reset_pledge,
+    carry_max_pledge,
+    carry_margin_call,
+    carry_base_target_mr,
+    carry_mr_soft,
+    carry_mr_hard,
+    carry_mr_emg,
+    carry_mr_rebuild,
+    carry_target_vol,
+    carry_stress_fixed,
+    carry_stress_atr_mult,
+    carry_max_days,
+    carry_rolloff_days,
+    carry_reset_days,
+    carry_reentry_days,
+    carry_add_step,
+    carry_reduce_step,
+    carry_hard_reduce_step,
+    carry_margin_rate,
+    hidden_strategy_presets,
+    ticker_for_daily,
+):
     # 確保 pandas 可用
     import pandas as pd
 
     # === 調試日誌（僅在 DEBUG 級別時顯示）===
-    logger.debug(f"update_tab 被調用 - tab: {tab}")
+    logger.debug(f"update_tab 被調用 - trigger: {ctx.triggered_id}, tab: {tab}")
     # === 根據主題決定顏色變數 ===
     if theme == 'theme-light':
         # 淺色模式配色
@@ -3815,12 +4807,61 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                 ds_for_calc = daily_state
                 logger.info(f"[UI] 使用原始 daily_state 進行 Smart Leverage 計算")
 
-            # 如果勾選了 Smart Leverage，立即計算並更新 Metrics
-            if smart_leverage_on and ds_for_calc is not None and not ds_for_calc.empty and 'w' in ds_for_calc.columns:
-                logger.info(f"[{strategy}] 啟用 Smart Leverage 計算 (更新指標與圖表)...")
+            smart_mode = str(smart_pledge_mode or DEFAULT_SMART_PLEDGE_MODE).strip().lower()
+            dip_params = {
+                "initial_pledge_ratio": dip_initial_pledge_ratio,
+                "margin_call_ratio": dip_margin_call_ratio,
+                "maintenance_safety_buffer": dip_maint_safety_buffer,
+                "target_annual_vol": dip_target_annual_vol,
+                "trend_ma": dip_trend_ma,
+                "dip_entry_dd": dip_entry_dd,
+                "dip_floor_dd": dip_floor_dd,
+                "dip_rebound_ret": dip_rebound_ret,
+                "dip_trend_floor": dip_trend_floor,
+                "dip_pledge_scale": dip_pledge_scale,
+                "pledge_max_days": dip_max_days,
+                "profit_take_threshold": dip_profit_take_th,
+                "profit_take_scale": dip_profit_take_scale,
+                "profit_take_hold_days": dip_profit_take_hold,
+                "margin_rate_annual": dip_margin_rate,
+            }
+            carry_params = {
+                "base_pledge_ratio": carry_base_pledge,
+                "min_operating_pledge_ratio": carry_min_op_pledge,
+                "reset_pledge_ratio": carry_reset_pledge,
+                "max_pledge_ratio": carry_max_pledge,
+                "margin_call_ratio": carry_margin_call,
+                "base_target_mr": carry_base_target_mr,
+                "mr_soft_reduce": carry_mr_soft,
+                "mr_hard_reduce": carry_mr_hard,
+                "mr_emergency": carry_mr_emg,
+                "mr_rebuild_line": carry_mr_rebuild,
+                "carry_target_annual_vol": carry_target_vol,
+                "stress_fixed_drop": carry_stress_fixed,
+                "stress_atr_mult": carry_stress_atr_mult,
+                "carry_max_days": carry_max_days,
+                "carry_rolloff_days": carry_rolloff_days,
+                "carry_reset_days": carry_reset_days,
+                "carry_reentry_wait_days": carry_reentry_days,
+                "add_step": carry_add_step,
+                "reduce_step": carry_reduce_step,
+                "hard_reduce_step": carry_hard_reduce_step,
+                "margin_rate_annual": carry_margin_rate,
+            }
+            smart_params = carry_params if smart_mode == "carry" else dip_params
 
-                # A. 計算新淨值 (0050 替代現金)
-                smart_ds = calculate_smart_leverage_equity(ds_for_calc, df_raw, safe_ticker="0050.TW")
+            # 如果勾選了 Smart Leverage，立即計算「自動質押槓桿」並更新 Metrics
+            if smart_leverage_on and ds_for_calc is not None and not ds_for_calc.empty and 'w' in ds_for_calc.columns:
+                logger.info(f"[{strategy}] 啟用 Smart Pledge 計算 (mode={smart_mode})...")
+
+                # A. 計算新淨值（自動質押槓桿）
+                smart_ds = calculate_smart_pledge_equity(
+                    ds_for_calc,
+                    df_raw,
+                    mode=smart_mode,
+                    params=smart_params,
+                    safe_ticker="0050.TW",
+                )
 
                 # B. 替換掉原本的變數，後面的畫圖會用到
                 if daily_state_std is not None and not daily_state_std.empty:
@@ -4220,11 +5261,11 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             last_sig_code = str(latest_t_signal.get("last_signal", "HOLD")).upper()
             last_sig_date = str(latest_t_signal.get("last_signal_date") or "N/A")
             sig_text_map = {"BUY": "買入", "SELL": "賣出", "HOLD": "觀望"}
-            sig_color_map = {"BUY": "#2f9e44", "SELL": "#e03131", "HOLD": "#868e96"}
+            sig_color_map = {"BUY": BUY_SIGNAL_COLOR, "SELL": SELL_SIGNAL_COLOR, "HOLD": HOLD_SIGNAL_COLOR}
             sig_label = sig_text_map.get(sig_code, sig_code)
-            sig_color = sig_color_map.get(sig_code, "#868e96")
+            sig_color = sig_color_map.get(sig_code, HOLD_SIGNAL_COLOR)
             last_sig_label = sig_text_map.get(last_sig_code, last_sig_code)
-            last_sig_color = sig_color_map.get(last_sig_code, "#868e96")
+            last_sig_color = sig_color_map.get(last_sig_code, HOLD_SIGNAL_COLOR)
             last_sig_reason = str(latest_t_signal.get("last_signal_reason") or "")
 
             def _friendly_signal_reason(raw_reason: str, signal_code: str, *, is_last: bool = False) -> str:
@@ -4332,6 +5373,55 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
             )
 
             summary_cards = [actionable_signal_card, latest_emitted_signal_card] + metric_cards
+            smart_status_section = html.Div()
+            if smart_leverage_on and ds_for_calc is not None and not ds_for_calc.empty:
+                call_days_actual = int(pd.to_numeric(ds_for_calc.get("call_days_actual", pd.Series([0])), errors="coerce").dropna().iloc[-1]) if "call_days_actual" in ds_for_calc.columns else int(pd.to_numeric(ds_for_calc.get("margin_call_trigger", pd.Series(dtype=bool))).fillna(False).sum())
+                stress_breach_days = int(pd.to_numeric(ds_for_calc.get("stress_breach_days", pd.Series([0])), errors="coerce").dropna().iloc[-1]) if "stress_breach_days" in ds_for_calc.columns else int(pd.to_numeric(ds_for_calc.get("stress_breach_trigger", pd.Series(dtype=bool))).fillna(False).sum())
+                stress_mr_min_val = float(pd.to_numeric(ds_for_calc.get("stress_mr_min", pd.Series(dtype=float)), errors="coerce").dropna().iloc[-1]) if "stress_mr_min" in ds_for_calc.columns and not pd.to_numeric(ds_for_calc.get("stress_mr_min"), errors="coerce").dropna().empty else float("nan")
+                smart_mode_label = str(ds_for_calc.get("smart_pledge_mode", pd.Series([smart_mode])).iloc[-1]) if "smart_pledge_mode" in ds_for_calc.columns else str(smart_mode)
+                w_series = pd.to_numeric(ds_for_calc.get("w", pd.Series(dtype=float)), errors="coerce")
+                w_base_series = pd.to_numeric(ds_for_calc.get("w_base", pd.Series(dtype=float)), errors="coerce")
+                borrow_pct_series = pd.to_numeric(ds_for_calc.get("borrow_pct", pd.Series(dtype=float)), errors="coerce")
+                latest_w = float(w_series.dropna().iloc[-1]) if not w_series.dropna().empty else float("nan")
+                latest_w_base = float(w_base_series.dropna().iloc[-1]) if not w_base_series.dropna().empty else float("nan")
+                latest_borrow_pct = float(borrow_pct_series.dropna().iloc[-1]) if not borrow_pct_series.dropna().empty else float("nan")
+                dw = (w_series.diff() * 100.0).replace([np.inf, -np.inf], np.nan)
+                adj_up_count = int((dw > 0.5).sum()) if not dw.dropna().empty else 0
+                adj_down_count = int((dw < -0.5).sum()) if not dw.dropna().empty else 0
+                smart_status_section = html.Div(
+                    [
+                        html.H6("Smart Pledge 風險摘要", style={"marginBottom": "4px", "color": font_color}),
+                        html.Div(
+                            f"模式={smart_mode_label} | call_days_actual={call_days_actual} | stress_breach_days={stress_breach_days} | stress_mr_min={stress_mr_min_val:.2f}" if np.isfinite(stress_mr_min_val)
+                            else f"模式={smart_mode_label} | call_days_actual={call_days_actual} | stress_breach_days={stress_breach_days} | stress_mr_min=N/A",
+                            style={"fontSize": "12px", "color": font_color, "opacity": 0.9},
+                        ),
+                        html.Div(
+                            (
+                                f"最新：總權重={latest_w*100:.2f}% / 基礎權重={latest_w_base*100:.2f}% / 借款加碼={latest_borrow_pct*100:.2f}%"
+                                if np.isfinite(latest_w) and np.isfinite(latest_w_base)
+                                else "最新權重資料：N/A"
+                            ),
+                            style={"fontSize": "12px", "color": font_color, "opacity": 0.9},
+                        ),
+                        html.Div(
+                            f"權重調整事件（>0.5pp）：上調 {adj_up_count} 次 / 下調 {adj_down_count} 次",
+                            style={"fontSize": "12px", "color": font_color, "opacity": 0.9},
+                        ),
+                        html.Div(
+                            "圖例說明：三角形買賣點=策略交易；權重圖的「上調/下調」點=Smart Pledge 調整倉位；基礎權重/借款加碼/目標權重可對照進出貨調整。",
+                            style={"fontSize": "12px", "color": font_color, "opacity": 0.9},
+                        ),
+                    ],
+                    style={
+                        "marginTop": "10px",
+                        "marginBottom": "10px",
+                        "padding": "8px 10px",
+                        "borderRadius": "6px",
+                        "border": f"1px solid {table_border}",
+                        "backgroundColor": table_cell_bg,
+                    },
+                )
             trade_table_style_conditional = []
             if isinstance(display_df, pd.DataFrame) and "Crash觸發" in display_df.columns:
                 trade_table_style_conditional = [
@@ -4369,6 +5459,7 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
                     style=unified_graph_style
                 ),
                 crash_xray_section,
+                smart_status_section,
 
                 # 原始的三張分離圖表（已註解）
                 # dcc.Graph(figure=fig1, config={'displayModeBar': True}, className='main-metrics-graph'),
@@ -4739,23 +5830,18 @@ def update_tab(data, tab, theme, smart_leverage_on, hidden_strategy_presets, tic
     Output('main-bg', 'className'),
     Output('theme-toggle', 'children'),
     Output('theme-store', 'data'),
-    # [新增] 控制上方參數列的樣式
-    Output('ctrl-row-basic', 'style'),
-    Output('ctrl-row-risk', 'style'),
-    Output('ctrl-row-ensemble', 'style'),
-    # [新增] 控制特殊標題的顏色
-    Output('label-risk-title', 'style'),
-    Output('label-maj-title', 'style'),
-    Output('label-prop-title', 'style'),
-    [Input("history-btn", "n_clicks"), Input("history-close", "n_clicks"), Input('theme-toggle', 'n_clicks')],
+    [
+        Input("history-btn", "n_clicks"),
+        Input("history-close", "n_clicks"),
+        Input('theme-toggle', 'n_clicks'),
+    ],
     [State("history-modal", "is_open"), State('theme-store', 'data')],
-    # 移除 prevent_initial_call=True，這樣初始化時才會正確渲染顏色
 )
 def toggle_history_modal_and_theme(history_btn, history_close, theme_btn, is_open, current_theme):
     ctx_trigger = ctx.triggered_id
 
     # 決定下一個主題
-    next_theme = current_theme
+    next_theme = current_theme or 'theme-dark'
     if ctx_trigger == "history-btn":
         next_theme = 'theme-dark'
         is_open = True
@@ -4769,50 +5855,11 @@ def toggle_history_modal_and_theme(history_btn, history_close, theme_btn, is_ope
             current_index = themes.index(current_theme)
             next_theme = themes[(current_index + 1) % len(themes)]
 
-    # === 定義樣式設定 (Style Presets) ===
-    # 預設邊框圓角
-    base_style = {'borderRadius': '4px', 'transition': 'background-color 0.3s'}
-
     if next_theme == 'theme-light':
-        # 淺色模式 (原版配色)
-        style_basic = {**base_style, 'backgroundColor': '#f8f9fa', 'border': '1px solid #dee2e6', 'color': '#212529'}
-        style_risk  = {**base_style, 'backgroundColor': '#fff3cd', 'border': '1px solid #ffeeba', 'color': '#856404'}
-        style_ens   = {**base_style, 'backgroundColor': '#d1ecf1', 'border': '1px solid #bee5eb', 'color': '#0c5460'}
-
-        # 標題顏色
-        c_risk = {'color': '#856404'} # 深黃
-        c_maj  = {'color': '#0066cc'} # 深藍
-        c_prop = {'color': '#28a745'} # 深綠
-
         btn_label = '🌕 淺色主題'
-
     elif next_theme == 'theme-blue':
-        # 藍色模式
-        style_basic = {**base_style, 'backgroundColor': '#0b1e3a', 'border': '1px solid #446688', 'color': '#ffe066'}
-        style_risk  = {**base_style, 'backgroundColor': '#3a2e05', 'border': '1px solid #886600', 'color': '#ffcc00'}
-        style_ens   = {**base_style, 'backgroundColor': '#0f2b33', 'border': '1px solid #005566', 'color': '#00ccff'}
-
-        c_risk = {'color': '#ffcc00'}
-        c_maj  = {'color': '#3399ff'}
-        c_prop = {'color': '#66ff66'}
-
         btn_label = '💙 藍黃主題'
-
-    else: # theme-dark (預設)
-        # 深色模式 (調整為深灰/深褐/深青，文字反白)
-        style_basic = {**base_style, 'backgroundColor': '#2b2b2b', 'border': '1px solid #444', 'color': '#e0e0e0'}
-
-        # Risk: 深褐色背景 + 金黃色邊框
-        style_risk  = {**base_style, 'backgroundColor': '#2c2505', 'border': '1px solid #665200', 'color': '#e0e0e0'}
-
-        # Ensemble: 深青色背景 + 青色邊框
-        style_ens   = {**base_style, 'backgroundColor': '#0c282e', 'border': '1px solid #0f4c5c', 'color': '#e0e0e0'}
-
-        # 標題顏色：在深色背景上需要亮一點
-        c_risk = {'color': '#ffc107'} # 亮黃 Warning
-        c_maj  = {'color': '#66b2ff'} # 亮藍
-        c_prop = {'color': '#75df8a'} # 亮綠
-
+    else:
         btn_label = '🌑 深色主題'
 
     return (
@@ -4820,9 +5867,128 @@ def toggle_history_modal_and_theme(history_btn, history_close, theme_btn, is_ope
         next_theme,
         btn_label,
         next_theme,
-        # 回傳樣式
-        style_basic, style_risk, style_ens,
-        c_risk, c_maj, c_prop
+    )
+
+
+# --------- Header 面板顯示/按鈕狀態（獨立於主題切換） ---------
+@app.callback(
+    Output('ctrl-row-basic', 'style'),
+    Output('advanced-panel-shell', 'style'),
+    Output('advanced-panel-empty-hint', 'style'),
+    Output('ctrl-row-risk', 'style'),
+    Output('ctrl-row-ensemble', 'style'),
+    Output('ctrl-row-smartpledge', 'style'),
+    Output('label-risk-title', 'style'),
+    Output('label-maj-title', 'style'),
+    Output('label-prop-title', 'style'),
+    Output('label-smart-title', 'style'),
+    Output('header-btn-basic', 'style'),
+    Output('header-btn-crash', 'style'),
+    Output('header-btn-ensemble', 'style'),
+    Output('header-btn-smartpledge', 'style'),
+    Input('theme-store', 'data'),
+    Input('header-panel-store', 'data'),
+)
+def update_header_panel_styles(current_theme, header_panel):
+    next_theme = str(current_theme or 'theme-dark')
+    panel = str(header_panel or "basic")
+    if panel not in {"basic", "crash", "ensemble", "smart"}:
+        panel = "basic"
+
+    base_style = {'borderRadius': '4px', 'transition': 'background-color 0.3s'}
+
+    if next_theme == 'theme-light':
+        style_basic = {**base_style, 'backgroundColor': '#f8f9fa', 'border': '1px solid #dee2e6', 'color': '#212529'}
+        style_risk  = {**base_style, 'backgroundColor': '#fff3cd', 'border': '1px solid #ffeeba', 'color': '#856404'}
+        style_ens   = {**base_style, 'backgroundColor': '#d1ecf1', 'border': '1px solid #bee5eb', 'color': '#0c5460'}
+        style_smart = {**base_style, 'backgroundColor': '#e6f4ea', 'border': '1px solid #b7e4c7', 'color': '#1f5132'}
+        style_hint = {'backgroundColor': '#f8f9fa', 'border': '1px dashed #ced4da', 'color': '#495057', 'padding': '8px 10px', 'borderRadius': '6px', 'opacity': 0.9}
+
+        c_risk = {'color': '#856404'}
+        c_maj  = {'color': '#0066cc'}
+        c_prop = {'color': '#28a745'}
+        c_smart = {'color': '#1f7a4d'}
+
+        btn_label = '🌕 淺色主題'
+        btn_active_bg = '#ffffff'
+        btn_text = '#212529'
+        btn_border = '#ced4da'
+
+    elif next_theme == 'theme-blue':
+        style_basic = {**base_style, 'backgroundColor': '#0b1e3a', 'border': '1px solid #446688', 'color': '#ffe066'}
+        style_risk  = {**base_style, 'backgroundColor': '#3a2e05', 'border': '1px solid #886600', 'color': '#ffcc00'}
+        style_ens   = {**base_style, 'backgroundColor': '#0f2b33', 'border': '1px solid #005566', 'color': '#00ccff'}
+        style_smart = {**base_style, 'backgroundColor': '#102a1a', 'border': '1px solid #2f7f57', 'color': '#7cf2b5'}
+        style_hint = {'backgroundColor': '#0b1e3a', 'border': '1px dashed #335577', 'color': '#ffe066', 'padding': '8px 10px', 'borderRadius': '6px', 'opacity': 0.9}
+
+        c_risk = {'color': '#ffcc00'}
+        c_maj  = {'color': '#3399ff'}
+        c_prop = {'color': '#66ff66'}
+        c_smart = {'color': '#7cf2b5'}
+
+        btn_label = '💙 藍黃主題'
+        btn_active_bg = '#12345b'
+        btn_text = '#ffe066'
+        btn_border = '#335577'
+
+    else:
+        style_basic = {**base_style, 'backgroundColor': '#2b2b2b', 'border': '1px solid #444', 'color': '#e0e0e0'}
+        style_risk  = {**base_style, 'backgroundColor': '#2c2505', 'border': '1px solid #665200', 'color': '#e0e0e0'}
+        style_ens   = {**base_style, 'backgroundColor': '#0c282e', 'border': '1px solid #0f4c5c', 'color': '#e0e0e0'}
+        style_smart = {**base_style, 'backgroundColor': '#11261a', 'border': '1px solid #2f6f48', 'color': '#d6f5df'}
+        style_hint = {'backgroundColor': '#1f1f1f', 'border': '1px dashed #444', 'color': '#adb5bd', 'padding': '8px 10px', 'borderRadius': '6px', 'opacity': 0.9}
+
+        c_risk = {'color': '#ffc107'}
+        c_maj  = {'color': '#66b2ff'}
+        c_prop = {'color': '#75df8a'}
+        c_smart = {'color': '#7fe7a6'}
+
+        btn_label = '🌑 深色主題'
+        btn_active_bg = '#2a2a2a'
+        btn_text = '#ffffff'
+        btn_border = '#444444'
+
+    basic_style = dict(style_basic)
+    basic_style["display"] = "block" if panel == "basic" else "none"
+    shell_style = {"display": "none" if panel == "basic" else "block", "minHeight": "48px"}
+    hint_style = dict(style_hint)
+    hint_style["display"] = "none"
+    risk_style = dict(style_risk)
+    ens_style = dict(style_ens)
+    smart_style = dict(style_smart)
+    risk_style["display"] = "block" if panel == "crash" else "none"
+    ens_style["display"] = "block" if panel == "ensemble" else "none"
+    smart_style["display"] = "block" if panel == "smart" else "none"
+
+    def _btn_style(active: bool, accent: str) -> Dict[str, str]:
+        if active:
+            return {
+                "backgroundColor": btn_active_bg,
+                "color": accent,
+                "border": f"1px solid {accent}",
+                "fontWeight": "bold",
+            }
+        return {
+            "backgroundColor": "transparent",
+            "color": btn_text,
+            "border": f"1px solid {btn_border}",
+        }
+
+    return (
+        basic_style,
+        shell_style,
+        hint_style,
+        risk_style,
+        ens_style,
+        smart_style,
+        c_risk,
+        c_maj,
+        c_prop,
+        c_smart,
+        _btn_style(panel == "basic", "#f1f3f5"),
+        _btn_style(panel == "crash", "#f59f00"),
+        _btn_style(panel == "ensemble", "#4dabf7"),
+        _btn_style(panel == "smart", "#51cf66"),
     )
 
 # --------- 下載交易紀錄 ---------
@@ -6980,6 +8146,6 @@ if __name__ == '__main__':
         debug=True,
         host='127.0.0.1',
         port=8050,
-        threaded=True,
+        threaded=True, # 允許多線程處理請求
         use_reloader=False  # 避免重載器造成的線程問題
     )

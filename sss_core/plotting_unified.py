@@ -21,6 +21,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 logger = logging.getLogger(__name__)
+BUY_SIGNAL_COLOR = "#40c057"
+SELL_SIGNAL_COLOR = "#fa5252"
 
 
 def _iter_true_spans(index: Iterable[pd.Timestamp], mask: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -49,6 +51,30 @@ def _iter_true_spans(index: Iterable[pd.Timestamp], mask: pd.Series) -> list[tup
     if start is not None and prev is not None:
         spans.append((pd.Timestamp(start), pd.Timestamp(prev)))
     return spans
+
+
+def _merge_nearby_spans(
+    spans: list[tuple[pd.Timestamp, pd.Timestamp]],
+    *,
+    max_gap_days: int,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Merge adjacent spans when gap between segments is smaller than max_gap_days."""
+    if not spans:
+        return []
+    merged: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    cur_start = pd.Timestamp(spans[0][0])
+    cur_end = pd.Timestamp(spans[0][1])
+    for start, end in spans[1:]:
+        s = pd.Timestamp(start)
+        e = pd.Timestamp(end)
+        if (s - cur_end).days <= max_gap_days:
+            if e > cur_end:
+                cur_end = e
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = s, e
+    merged.append((cur_start, cur_end))
+    return merged
 
 
 def _truthy_series(raw: pd.Series) -> pd.Series:
@@ -298,7 +324,24 @@ def create_unified_dashboard(
         opacity: float,
         layer: str = "below",
     ) -> None:
-        for start, end in spans:
+        spans_to_draw = list(spans)
+        max_vrects = 80
+        if len(spans_to_draw) > max_vrects:
+            for gap_days in (2, 5, 10):
+                spans_to_draw = _merge_nearby_spans(spans_to_draw, max_gap_days=gap_days)
+                if len(spans_to_draw) <= max_vrects:
+                    break
+        if len(spans_to_draw) > max_vrects:
+            step = int(np.ceil(len(spans_to_draw) / max_vrects))
+            spans_to_draw = spans_to_draw[::step]
+        if len(spans_to_draw) != len(spans):
+            logger.debug(
+                "vrect spans compressed on row %s: %s -> %s",
+                row,
+                len(spans),
+                len(spans_to_draw),
+            )
+        for start, end in spans_to_draw:
             x0 = pd.Timestamp(start)
             x1 = pd.Timestamp(end) + pd.Timedelta(days=1)
             fig.add_vrect(
@@ -314,10 +357,11 @@ def create_unified_dashboard(
 
     # Row 1: 股價與買賣點
     if not df_raw_aligned.empty and close_col:
+        close_on_price_row = pd.to_numeric(df_raw_aligned[close_col], errors="coerce")
         _add_trace(
             go.Scatter(
                 x=df_raw_aligned.index,
-                y=pd.to_numeric(df_raw_aligned[close_col], errors="coerce"),
+                y=close_on_price_row,
                 name=labels["close"],
                 line=dict(color="#636EFA", width=1.5),
             ),
@@ -327,6 +371,50 @@ def create_unified_dashboard(
             aligned_state = crash_state_series.reindex(df_raw_aligned.index).ffill().fillna(1.0)
             crash_spans = _iter_true_spans(df_raw_aligned.index, aligned_state < 0.999)
             _add_vrect_spans(crash_spans, row=1, color="#ff6b6b", opacity=0.10)
+
+        # Smart Pledge 事件標記：加上上下位移，避免重疊看不清。
+        if not ds.empty:
+            close_on_ds = close_on_price_row.reindex(ds.index).ffill()
+            event_specs = [
+                ("pledge_reset_trigger", "質押重置觸發", "circle-open", "#ff922b", 11, 0.014),
+                ("profit_take_trigger", "獲利降槓桿觸發", "diamond-open", "#20c997", 11, 0.028),
+                ("margin_call_trigger", "追繳觸發", "x", SELL_SIGNAL_COLOR, 12, -0.014),
+                ("carry_rolloff_trigger", "Carry 到期前降槓桿", "square-open", "#74c0fc", 10, 0.042),
+            ]
+            for col, label, symbol, color, size, y_offset in event_specs:
+                if col not in ds.columns:
+                    continue
+                event_mask = _truthy_series(ds[col]).reindex(ds.index).fillna(False)
+                if not bool(event_mask.any()):
+                    continue
+                ev_idx = ds.index[event_mask]
+                ev_y_raw = pd.to_numeric(close_on_ds.reindex(ev_idx), errors="coerce")
+                valid = ev_y_raw.notna()
+                if not bool(valid.any()):
+                    continue
+                ev_idx = ev_idx[valid]
+                ev_y_raw = ev_y_raw[valid]
+                ev_y = ev_y_raw * (1.0 + y_offset)
+                _add_trace(
+                    go.Scatter(
+                        x=ev_idx,
+                        y=ev_y,
+                        mode="markers",
+                        name=label,
+                        marker=dict(symbol=symbol, size=size, color=color, line=dict(color=color, width=1.5)),
+                        customdata=np.column_stack([ev_y_raw.values]),
+                        hovertemplate="日期=%{x|%Y-%m-%d}<br>收盤=%{customdata[0]:,.2f}<br>事件="
+                        + label
+                        + "<extra></extra>",
+                    ),
+                    row=1,
+                )
+
+            # Carry 暫停/重置期改成背景帶，避免連續點造成圖面雜訊。
+            if "carry_cycle_paused_or_reset" in ds.columns:
+                paused_mask = _truthy_series(ds["carry_cycle_paused_or_reset"]).reindex(ds.index).fillna(False)
+                paused_spans = _iter_true_spans(ds.index, paused_mask)
+                _add_vrect_spans(paused_spans, row=1, color="#adb5bd", opacity=0.08)
 
     trade_source = crash_trade_df if (isinstance(crash_trade_df, pd.DataFrame) and not crash_trade_df.empty) else trade_df
     if trade_source is not None and not trade_source.empty:
@@ -362,7 +450,7 @@ def create_unified_dashboard(
                         y=pd.to_numeric(normal_buys["price"], errors="coerce"),
                         mode="markers",
                         name=labels["buy"],
-                        marker=dict(symbol="triangle-up", size=9, color="#00CC96"),
+                        marker=dict(symbol="triangle-up", size=9, color=BUY_SIGNAL_COLOR),
                     ),
                     row=1,
                 )
@@ -373,7 +461,7 @@ def create_unified_dashboard(
                         y=pd.to_numeric(normal_sells["price"], errors="coerce"),
                         mode="markers",
                         name=labels["sell"],
-                        marker=dict(symbol="triangle-down", size=9, color="#EF553B"),
+                        marker=dict(symbol="triangle-down", size=9, color=SELL_SIGNAL_COLOR),
                     ),
                     row=1,
                 )
@@ -437,8 +525,8 @@ def create_unified_dashboard(
             elif {"is_buy_signal", "is_sell_signal"}.issubset(indicator.columns):
                 buy_mask = _truthy_series(indicator["is_buy_signal"]).reindex(indicator.index).fillna(False)
                 sell_mask = _truthy_series(indicator["is_sell_signal"]).reindex(indicator.index).fillna(False)
-            _add_vrect_spans(_iter_true_spans(indicator.index, buy_mask), row=row_indicator, color="#40c057", opacity=0.10)
-            _add_vrect_spans(_iter_true_spans(indicator.index, sell_mask), row=row_indicator, color="#fa5252", opacity=0.10)
+            _add_vrect_spans(_iter_true_spans(indicator.index, buy_mask), row=row_indicator, color=BUY_SIGNAL_COLOR, opacity=0.10)
+            _add_vrect_spans(_iter_true_spans(indicator.index, sell_mask), row=row_indicator, color=SELL_SIGNAL_COLOR, opacity=0.10)
         if "base" in indicator.columns:
             _add_trace(
                 go.Scatter(
@@ -455,7 +543,7 @@ def create_unified_dashboard(
                     x=indicator.index,
                     y=pd.to_numeric(indicator["buy_threshold"], errors="coerce"),
                     name=labels["buy_threshold"],
-                    line=dict(color="#40c057", width=1.2, dash="dot"),
+                    line=dict(color=BUY_SIGNAL_COLOR, width=1.2, dash="dot"),
                 ),
                 row=row_indicator,
             )
@@ -465,7 +553,7 @@ def create_unified_dashboard(
                     x=indicator.index,
                     y=pd.to_numeric(indicator["sell_threshold"], errors="coerce"),
                     name=labels["sell_threshold"],
-                    line=dict(color="#fa5252", width=1.2, dash="dash"),
+                    line=dict(color=SELL_SIGNAL_COLOR, width=1.2, dash="dash"),
                 ),
                 row=row_indicator,
             )
@@ -492,19 +580,110 @@ def create_unified_dashboard(
                 ),
                 row=row_eq,
             )
+        cash_series = pd.Series(dtype=float)
+        if "cash" in ds.columns:
+            cash_series = pd.to_numeric(ds["cash"], errors="coerce")
+        elif {"portfolio_value", "position_value"}.issubset(ds.columns):
+            cash_series = pd.to_numeric(ds["portfolio_value"], errors="coerce") - pd.to_numeric(ds["position_value"], errors="coerce")
+        elif {"equity", "position_value"}.issubset(ds.columns):
+            cash_series = pd.to_numeric(ds["equity"], errors="coerce") - pd.to_numeric(ds["position_value"], errors="coerce")
+        if cash_series.notna().any():
+            _add_trace(
+                go.Scatter(
+                    x=ds.index,
+                    y=cash_series,
+                    name=labels["cash"],
+                    line=dict(color="#74c0fc", width=1.3, dash="dot"),
+                ),
+                row=row_eq,
+            )
 
-    # Row 持倉權重
+    # Row 持倉權重（Smart Pledge 啟用時補充權重調整資訊）
     if not ds.empty and "w" in ds.columns:
+        w_total_pct = pd.to_numeric(ds["w"], errors="coerce") * 100
         _add_trace(
             go.Scatter(
                 x=ds.index,
-                y=pd.to_numeric(ds["w"], errors="coerce") * 100,
+                y=w_total_pct,
                 name=labels["weight"],
                 fill="tozeroy",
-                line=dict(color="#AB63FA", width=1.5),
+                line=dict(color="#AB63FA", width=1.6),
             ),
             row=row_weight,
         )
+
+        if "w_base" in ds.columns:
+            w_base_pct = pd.to_numeric(ds["w_base"], errors="coerce") * 100
+            _add_trace(
+                go.Scatter(
+                    x=ds.index,
+                    y=w_base_pct,
+                    name="基礎權重(策略原始)",
+                    line=dict(color="#adb5bd", width=1.1, dash="dash"),
+                ),
+                row=row_weight,
+            )
+
+        if "borrow_pct" in ds.columns:
+            borrow_pct = pd.to_numeric(ds["borrow_pct"], errors="coerce").clip(lower=0.0) * 100
+            _add_trace(
+                go.Scatter(
+                    x=ds.index,
+                    y=borrow_pct,
+                    name="借款加碼權重",
+                    line=dict(color="#ff922b", width=1.2),
+                ),
+                row=row_weight,
+            )
+            leverage_spans = _iter_true_spans(ds.index, borrow_pct > 0.05)
+            _add_vrect_spans(leverage_spans, row=row_weight, color="#ffe8cc", opacity=0.10)
+
+        if "w_target" in ds.columns:
+            w_target_pct = pd.to_numeric(ds["w_target"], errors="coerce") * 100
+            _add_trace(
+                go.Scatter(
+                    x=ds.index,
+                    y=w_target_pct,
+                    name="目標權重(調整後)",
+                    line=dict(color="#66d9e8", width=1.0, dash="dot"),
+                ),
+                row=row_weight,
+            )
+
+        # 權重調整事件點（非策略 BUY/SELL）
+        dw = w_total_pct.diff().fillna(0.0)
+        up_mask = dw > 0.5
+        down_mask = dw < -0.5
+        if bool(up_mask.any()):
+            up_idx = ds.index[up_mask]
+            up_y = w_total_pct.reindex(up_idx)
+            _add_trace(
+                go.Scatter(
+                    x=up_idx,
+                    y=up_y,
+                    mode="markers",
+                    name="權重上調(槓桿/調倉)",
+                    marker=dict(symbol="triangle-up", size=8, color="#f59f00"),
+                    customdata=np.column_stack([dw.reindex(up_idx).values]),
+                    hovertemplate="日期=%{x|%Y-%m-%d}<br>總權重=%{y:.2f}%<br>權重變化=%{customdata[0]:+.2f}pp<extra></extra>",
+                ),
+                row=row_weight,
+            )
+        if bool(down_mask.any()):
+            down_idx = ds.index[down_mask]
+            down_y = w_total_pct.reindex(down_idx)
+            _add_trace(
+                go.Scatter(
+                    x=down_idx,
+                    y=down_y,
+                    mode="markers",
+                    name="權重下調(槓桿/調倉)",
+                    marker=dict(symbol="triangle-down", size=8, color="#e03131"),
+                    customdata=np.column_stack([dw.reindex(down_idx).values]),
+                    hovertemplate="日期=%{x|%Y-%m-%d}<br>總權重=%{y:.2f}%<br>權重變化=%{customdata[0]:+.2f}pp<extra></extra>",
+                ),
+                row=row_weight,
+            )
 
     # Row LIFO 報酬
     lifo_y_range = None
